@@ -7,6 +7,8 @@ import json
 import html
 import secrets
 import re
+import hashlib
+from collections import OrderedDict
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -25,6 +27,8 @@ ROOT = Path(__file__).resolve().parent
 app = FastAPI(title="Margin", docs_url=None, redoc_url=None)
 MAX_BODY = 9_000_000
 _analysis_slots = asyncio.Semaphore(1)
+_PREFIX_CACHE_LIMIT = 32
+_verified_prefixes: OrderedDict = OrderedDict()
 
 
 class BBox(BaseModel):
@@ -36,6 +40,7 @@ class BBox(BaseModel):
 
 class InputLine(BaseModel):
     id: str
+    number: int | None = Field(default=None, ge=1, le=1000)
     text: str = Field(default="", max_length=1200)
     bbox: BBox | None = None
     y: float | None = None
@@ -211,6 +216,7 @@ def combine_feedback(request: AnalyzeRequest, reading: llm.BoardReading, verific
         item = line.model_dump()
         item["bbox"] = source.bbox.model_dump() if source.bbox else None
         item["y"] = source.y
+        item["number"] = source.number
         item["verifiedBy"] = "ai"
         if source.text.strip():
             item["text"] = source.text
@@ -250,7 +256,7 @@ def combine_feedback(request: AnalyzeRequest, reading: llm.BoardReading, verific
         symbolic_complete = (simple_solution and "=" in request.problem) or derivative_complete
     solved = bool(all_correct and (reading.solved or symbolic_complete))
     if first_error:
-        index = next(i for i, row in enumerate(result, 1) if row["id"] == first_error)
+        index = next(row.get("number") or i for i, row in enumerate(result, 1) if row["id"] == first_error)
         summary = f"Let's take another look at line {index}."
     elif any(row["status"] == "uncertain" for row in result):
         summary = "I need a clearer reading of one line before checking the next step."
@@ -263,6 +269,64 @@ def combine_feedback(request: AnalyzeRequest, reading: llm.BoardReading, verific
             "summary": summary, "solved": solved, "verificationAvailable": verification.get("available", False), "processingMode": processing_mode}
 
 
+def _line_signatures(request: AnalyzeRequest) -> tuple:
+    """Exact text is authoritative; unidentified ink falls back to its image."""
+    image_hash = None
+    signatures = []
+    for line in request.lines:
+        fingerprint = line.fingerprint or ""
+        if not fingerprint and not line.text.strip():
+            if image_hash is None:
+                image_hash = hashlib.sha256((request.image or "").encode()).hexdigest()
+            fingerprint = image_hash + json.dumps(line.bbox.model_dump() if line.bbox else None, sort_keys=True)
+        signatures.append((line.id, fingerprint, line.text))
+    return tuple(signatures)
+
+
+def _cached_prefix(problem: str, signatures: tuple) -> tuple[list, list, bool, bool]:
+    best_key, count = None, 0
+    for key in _verified_prefixes:
+        if key[0] != problem:
+            continue
+        matched = 0
+        for old, current in zip(key[1], signatures):
+            if old != current:
+                break
+            matched += 1
+        if matched > count:
+            best_key, count = key, matched
+    if best_key is None:
+        return [], [], False, False
+    cached = _verified_prefixes[best_key]
+    _verified_prefixes.move_to_end(best_key)
+    rows = [row.model_copy(deep=True) for row in cached["rows"][:count]]
+    verdicts = [dict(row) for row in cached["verdicts"][:count]]
+    solved = cached["solved"] and count == len(signatures) == len(cached["rows"])
+    ai_reviewed = any(source == "ai" for source in cached["sources"][:count])
+    return rows, verdicts, solved, ai_reviewed
+
+
+def _remember_prefix(request: AnalyzeRequest, signatures: tuple, result: dict, verification: dict) -> None:
+    rows = []
+    for row in result["lines"]:
+        if row["status"] != "correct" or min(row["confidence"], row["transcriptionConfidence"]) < .8:
+            break
+        rows.append(row)
+    if not rows:
+        return
+    verdict_map = {str(row["id"]): row for row in verification.get("results", [])}
+    key = (request.problem, signatures[:len(rows)])
+    _verified_prefixes[key] = {
+        "rows": [llm.ReadLine.model_validate(row) for row in rows],
+        "verdicts": [dict(verdict_map.get(row["id"], {"id": row["id"], "status": "unknown"})) for row in rows],
+        "sources": [row["verifiedBy"] for row in rows],
+        "solved": bool(result["solved"] and len(rows) == len(request.lines)),
+    }
+    _verified_prefixes.move_to_end(key)
+    while len(_verified_prefixes) > _PREFIX_CACHE_LIMIT:
+        _verified_prefixes.popitem(last=False)
+
+
 @app.post("/api/analyze")
 async def analyze(request: AnalyzeRequest):
     if not request.lines:
@@ -270,28 +334,41 @@ async def analyze(request: AnalyzeRequest):
                 "summary": "Write your first step when you're ready.", "solved": False, "verificationAvailable": verifier_available()}
     if len({line.id for line in request.lines}) != len(request.lines):
         raise llm.LLMError("Each board line needs a unique identifier.", 400, "invalid_request")
+    signatures = _line_signatures(request)
+    prefix, cached_verdicts, cached_solved, cached_ai = _cached_prefix(request.problem, signatures)
+    remaining = request.lines[len(prefix):]
     # Exact typed text and symbolic checking do not compete with a slow AI chat.
-    if all(line.text.strip() for line in request.lines):
-        reading = await llm.read_and_coach(request.problem, request.image, [line.model_dump() for line in request.lines])
+    if not remaining:
+        reading = llm.BoardReading(lines=[], summary="Your steps check out so far. Keep going.", solved=cached_solved)
+    elif all(line.text.strip() for line in remaining):
+        reading = await llm.read_and_coach(request.problem, request.image, [line.model_dump() for line in remaining])
     else:
         async with _analysis_slots:
-            reading = await llm.read_and_coach(request.problem, request.image, [line.model_dump() for line in request.lines])
+            reading = await llm.read_and_coach(request.problem, request.image, [line.model_dump() for line in remaining])
+    reading.lines = prefix + reading.lines
+    reading.aiReviewed = cached_ai
     read_map = {line.id: line for line in reading.lines}
     safe_lines = []
-    for source in request.lines:
+    for source in remaining:
         row = read_map.get(source.id)
         # A low-confidence transcription must never poison symbolic comparisons.
         if not source.text.strip() and (row is None or row.transcriptionConfidence < 0.8):
             break
         safe_lines.append({"id": source.id, "text": source.text or (row.text if row else "")})
-    try:
-        verification = await asyncio.wait_for(asyncio.to_thread(verify_lines, request.problem, safe_lines), timeout=5)
-    except (Exception, asyncio.TimeoutError):
-        verification = {"available": False, "results": []}
+    verification = {"available": verifier_available(), "results": []}
+    if safe_lines:
+        try:
+            options = {"previous_line": prefix[-1].text} if prefix else {}
+            verification = await asyncio.wait_for(asyncio.to_thread(verify_lines, request.problem, safe_lines, **options), timeout=5)
+        except (Exception, asyncio.TimeoutError):
+            verification = {"available": False, "results": []}
+    verification["results"] = cached_verdicts + verification.get("results", [])
     if llm.unverified_ids(reading, verification):
         async with _analysis_slots:
             reading = await llm.judge_unverified(request.problem, reading, verification)
-    return combine_feedback(request, reading, verification)
+    result = combine_feedback(request, reading, verification)
+    _remember_prefix(request, signatures, result, verification)
+    return result
 
 
 @app.post("/api/chat")

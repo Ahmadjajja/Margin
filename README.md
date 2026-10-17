@@ -6,15 +6,16 @@ This is a local hackathon prototype built with **FastAPI, plain HTML/CSS/JavaScr
 
 ## The experience
 
-- Start in the separate **Problem** area. Type the statement or write it on the top canvas, then review what the tutor read in the right panel. Correct the text if needed and confirm it before solving.
-- Work in the **Solution** area below. Only this canvas is checked for solution steps; the confirmed problem supplies the context. Changing the problem requires confirmation again.
+- Start in the separate **Problem** area. Handwriting is read automatically after a two-second pause. Review the reading in the right panel, correct it if needed, and confirm before solving. Typing and a manual retry are also available.
+- Work in the **Solution** area below. Each numbered row is one complete step, including tall fractions and division symbols. Rows grow to fit your writing; select **Next line** to start another step. Only solution rows are checked against the confirmed problem.
 - Type a step and press **Enter** for an immediate check. Supported typed algebra goes directly to SymPy, without waiting for an AI request.
 - Draw with a stylus, finger, or mouse. Pause for two seconds to trigger a handwriting check; **Check work** is also available.
-- Review what the tutor read. **Edit reading** fixes a handwriting transcription without erasing your work; **Edit step** changes a typed equation on the board.
+- Review what the tutor read. **Yes, that’s what I wrote** confirms a transcription and checks the mathematics again; it does not automatically mark the step correct. **Edit reading** fixes a transcription; **Edit step** changes a typed equation.
 - See the first questionable line highlighted beside a Socratic hint. Ask for a stronger hint when needed.
+- Correct, unchanged steps stay checked while you add work. Editing a step invalidates it and dependent later checks; changing the problem requires a fresh check.
 - Erase or undo a mistake, rewrite it, and receive fresh feedback on the current board.
 - Ask questions in the adjacent chat, which receives the problem and current board.
-- Refresh without losing the current board and conversation, when browser storage is available.
+- Refresh without losing the current problem and board, when browser storage is available. Chat messages clear on refresh for a clean demo.
 
 There is no application account system or database. Provider sign-in connects the tutor. Mistake memory, personalized practice, voice tutoring, and a class dashboard are future directions, not implemented features.
 
@@ -95,9 +96,9 @@ If the tablet cannot connect, check that both devices are on the same network an
 
 ## How a check works
 
-1. **Capture:** the browser groups strokes into rows with stable IDs, content fingerprints, and normalized bounding boxes. Export preserves the displayed aspect ratio so handwriting is not stretched before recognition.
+1. **Capture:** each explicit solution row has a stable ID, content fingerprint, and normalized bounding box. All strokes in a row stay together even when numerator, denominator, or division dots are vertically separated. Export preserves the displayed aspect ratio so handwriting is not stretched before recognition.
 2. **Read only when needed:** typed rows and corrected transcriptions skip image recognition. A compact vision request reads new handwritten rows; unchanged, confidently read rows can reuse a bounded in-memory cache. This cache is temporary request optimization, not student mistake memory.
-3. **Verify locally:** SymPy checks supported algebraic transitions against the original problem and preceding line. A handwritten transcription must have confidence of at least **0.8** before it enters symbolic verification. Supported typed algebra needs no model call. Local hints point to distribution, signs, domains, or equivalent operations.
+3. **Verify locally:** SymPy checks supported algebraic transitions against the original problem and preceding line. A handwritten transcription must have confidence of at least **0.8** before it enters symbolic verification. Supported typed algebra needs no model call. A bounded in-memory cache reuses the already correct, unchanged prefix; edits invalidate dependent checks. Local hints point to distribution, signs, domains, or equivalent operations.
 4. **Review broader math:** unsupported steps receive contextual AI review, with a **0.8** confidence minimum. Unclear work is uncertain, never automatically wrong. After the earliest error or uncertainty, dependent rows wait for clarification.
 5. **Display:** the frontend uses its own row boxes to position highlights, shows the recognized text, and lets the student correct it. One board check runs at a time; older responses cannot overwrite newer work. Tutor chat uses the current problem and board.
 
@@ -114,7 +115,7 @@ The verifier compares real solution sets for supported single-variable equations
 | File | Role |
 | --- | --- |
 | `static/index.html`, `static/styles.css` | Whiteboard and tutor interface |
-| `static/board.js` | Drawing, erasing, history, row grouping, image export |
+| `static/board.js`, `static/solution-board.js` | Drawing, growing solution rows, erasing, history, image export |
 | `static/app.js` | Pause detection, requests, revision checks, chat, browser persistence |
 | `main.py` | FastAPI routes, request validation, confidence gates, feedback combination |
 | `llm.py` | Provider requests, handwriting reader, coach, tutor chat |
@@ -123,7 +124,7 @@ The verifier compares real solution sets for supported single-variable equations
 | `run.py`, `start.ps1` | Local launchers |
 | `tests/` | Math, backend, and board regression checks |
 
-`GET /api/status` reports the configured connection and SymPy availability. `POST /api/read-problem` transcribes the separate problem canvas without solving it; the student confirms or edits that transcription. `POST /api/analyze` checks the solution board against the confirmed problem; `POST /api/chat` answers with that context. The server does not save board images to disk. The browser stores the current problem, strokes, and recent conversation locally; AI requests send the relevant problem or solution image to the active provider.
+`GET /api/status` reports the configured connection and SymPy availability. `POST /api/read-problem` transcribes the separate problem canvas without solving it; the student confirms or edits that transcription. `POST /api/analyze` checks the solution board against the confirmed problem; `POST /api/chat` answers with that context. The server does not save board images to disk. The browser stores the current problem and solution locally; conversation messages stay in page memory and clear on refresh. AI requests send the relevant problem or solution image to the active provider.
 
 ## Tests and demonstration
 
@@ -136,7 +137,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 For the optional browser-independent board checks, use a modern Node.js release:
 
 ```sh
-node --test tests/board.test.mjs
+node --test tests/board.test.mjs tests/solution-board.test.mjs
 ```
 
 These tests cover symbolic mistakes and corrections, valid alternate paths, confidence handling, and row grouping. Passing them does not establish that a particular provider account can complete live inference. Verify that separately before the demo.

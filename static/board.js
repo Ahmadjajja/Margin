@@ -19,7 +19,7 @@ function rowFingerprint(entries) {
   // A pair of independent 32-bit hashes is sufficient for local change detection.
   // Hash visible content, not the row number or other rows' state.
   const content = JSON.stringify([...entries].sort((a, b) => a.index - b.index).map(({s}) =>
-    s.kind === 'text' ? ['text', s.id, s.text, s.x, s.y, s.width, s.fontSize ?? null] :
+    s.kind === 'text' ? ['text', s.id, s.text, s.x, s.y] :
       ['stroke', s.id, s.inkWidth ?? null, s.points.map(p => [p.x, p.y])]
   ));
   let first = 2166136261, second = 2246822519;
@@ -42,7 +42,7 @@ function bounds(stroke) {
 
 // Geometry stays in board coordinates. The same normalized boxes are sent to
 // the reader and used by the UI, so model guesses never position underlines.
-export function groupStrokesIntoLines(strokes) {
+export function groupStrokesIntoLines(strokes, {height = HEIGHT} = {}) {
   const entries = strokes.filter(s => s.kind === 'text' || s.points?.length).map((s, index) => ({s, index, b: bounds(s)}));
   entries.sort((a, b) => a.b.y + a.b.height / 2 - b.b.y - b.b.height / 2);
   const groups = [];
@@ -70,12 +70,32 @@ export function groupStrokesIntoLines(strokes) {
     const onlyText = group.items.every(item => item.s.kind === 'text');
     const box = {
       x: clamp((group.left - 6) / WIDTH, 0, 1),
-      y: clamp((group.top - 6) / HEIGHT, 0, 1),
+      y: clamp((group.top - 6) / height, 0, 1),
       width: clamp((group.right - group.left + 12) / WIDTH, .015, 1),
-      height: clamp((group.bottom - group.top + 12) / HEIGHT, .018, 1),
+      height: clamp((group.bottom - group.top + 12) / height, .018, 1),
     };
-    return { id: oldest.id, fingerprint: rowFingerprint(group.items), number: index + 1, ...(onlyText ? {text: group.items.sort((a,b) => a.b.x - b.b.x).map(item => item.s.text).join(' ')} : {}), bbox: box, y: (group.top + group.bottom) / 2 / HEIGHT };
+    return { id: oldest.id, fingerprint: rowFingerprint(group.items), number: index + 1, ...(onlyText ? {text: group.items.sort((a,b) => a.b.x - b.b.x).map(item => item.s.text).join(' ')} : {}), bbox: box, y: (group.top + group.bottom) / 2 / height };
   });
+}
+
+// Explicit step rows use the entire canvas as one math statement. Fractions,
+// long division, and nested work must never be split by their vertical layout.
+export function summarizeStrokes(strokes, {id: rowId, height = HEIGHT} = {}) {
+  const entries = strokes.filter(s => s.kind === 'text' || s.points?.length).map((s, index) => ({s, index, b: bounds(s)}));
+  if (!entries.length) return null;
+  const left = Math.min(...entries.map(item => item.b.x));
+  const top = Math.min(...entries.map(item => item.b.y));
+  const right = Math.max(...entries.map(item => item.b.x + item.b.width));
+  const bottom = Math.max(...entries.map(item => item.b.y + item.b.height));
+  const x = clamp((left - 8) / WIDTH, 0, 1), y = clamp((top - 8) / height, 0, 1);
+  const onlyText = entries.every(item => item.s.kind === 'text');
+  return {
+    id: rowId || entries[0].s.id,
+    fingerprint: rowFingerprint(entries),
+    ...(onlyText ? {text: [...entries].sort((a, b) => a.b.y - b.b.y || a.b.x - b.b.x).map(item => item.s.text).join(' ')} : {}),
+    bbox: {x, y, width: Math.max(.001, clamp((right + 8) / WIDTH, 0, 1) - x), height: Math.max(.001, clamp((bottom + 8) / height, 0, 1) - y)},
+    bounds: {left, top, right, bottom},
+  };
 }
 
 function distanceToSegment(p, a, b) {
@@ -85,10 +105,11 @@ function distanceToSegment(p, a, b) {
 }
 
 export class Whiteboard {
-  constructor(canvas, {onChange = () => {}, ariaLabel} = {}) {
+  constructor(canvas, {onChange = () => {}, ariaLabel, logicalHeight = HEIGHT} = {}) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
     this.onChange = onChange;
+    this.logicalHeight = Number.isFinite(logicalHeight) && logicalHeight > 0 ? logicalHeight : HEIGHT;
     this.strokes = [];
     this.history = [];
     this.tool = 'pen';
@@ -97,7 +118,7 @@ export class Whiteboard {
     this.pointerType = null;
     this._drawing = false;
     canvas.width = WIDTH;
-    canvas.height = HEIGHT;
+    canvas.height = this.height;
     canvas.style.touchAction = 'none';
     canvas.setAttribute('aria-label', ariaLabel || canvas.getAttribute?.('aria-label') || 'Math whiteboard. Draw with a pen, finger, or mouse. Use Type a step for keyboard input.');
     this.handlers = {
@@ -115,7 +136,13 @@ export class Whiteboard {
   }
   get isDrawing() { return this._drawing; }
   get width() { return WIDTH; }
-  get height() { return HEIGHT; }
+  get height() { return this.logicalHeight; }
+  setLogicalHeight(height) {
+    if (!Number.isFinite(height) || height <= 0) return false;
+    this.logicalHeight = height;
+    this.render();
+    return true;
+  }
   isEmpty() { return this.strokes.length === 0; }
   getState() { return JSON.parse(JSON.stringify(this.strokes)); }
   setState(state) {
@@ -138,7 +165,7 @@ export class Whiteboard {
   }
   point(e) {
     const r = this.canvas.getBoundingClientRect();
-    return { x: clamp((e.clientX - r.left) / r.width * WIDTH, 0, WIDTH), y: clamp((e.clientY - r.top) / r.height * HEIGHT, 0, HEIGHT), p: e.pointerType === 'pen' ? clamp(e.pressure || .5, .15, 1) : .5 };
+    return { x: clamp((e.clientX - r.left) / r.width * WIDTH, 0, WIDTH), y: clamp((e.clientY - r.top) / r.height * this.height, 0, this.height), p: e.pointerType === 'pen' ? clamp(e.pressure || .5, .15, 1) : .5 };
   }
   start(e) {
     if (e.pointerType === 'mouse' && e.button !== 0) return;
@@ -201,7 +228,7 @@ export class Whiteboard {
     // Hit-test in screen pixels: a compact problem board must not have an
     // eraser that reaches sideways but misses strokes a few pixels above it.
     const rect = this.canvas.getBoundingClientRect();
-    const sx = (rect.width || WIDTH) / WIDTH, sy = (rect.height || HEIGHT) / HEIGHT;
+    const sx = (rect.width || WIDTH) / WIDTH, sy = (rect.height || this.height) / this.height;
     const radius = 16, rx = radius / sx, ry = radius / sy;
     const screenPoint = {x: p.x * sx, y: p.y * sy};
     this.strokes = this.strokes.filter(stroke => {
@@ -234,10 +261,10 @@ export class Whiteboard {
     if (!text || this._drawing) return false;
     this.snapshot();
     const lines = this.getLines();
-    const lastBottom = lines.length ? Math.max(...lines.map(line => (line.bbox.y + line.bbox.height) * HEIGHT)) : 35;
+    const lastBottom = lines.length ? Math.max(...lines.map(line => (line.bbox.y + line.bbox.height) * this.height)) : 35;
     const metrics = this.textMetrics(text, 82);
     const y = Math.max(100, lastBottom + Math.max(80, metrics.fontSize * 1.5));
-    if (y > HEIGHT - 35) { this.history.pop(); return false; }
+    if (y > this.height - 35) { this.history.pop(); return false; }
     this.strokes.push({id: id(), kind: 'text', text, x: 82, y, ...metrics});
     this.render();
     this.onChange(this.getState());
@@ -245,7 +272,7 @@ export class Whiteboard {
   }
   textMetrics(text, x) {
     const rect = this.canvas.getBoundingClientRect();
-    const sx = (rect.width || WIDTH) / WIDTH, sy = (rect.height || HEIGHT) / HEIGHT;
+    const sx = (rect.width || WIDTH) / WIDTH, sy = (rect.height || this.height) / this.height;
     const available = Math.max(20, (WIDTH - x) * sx - 18);
     this.ctx.font = `27px ${MATH_FONT}`;
     const desiredWidth = this.ctx.measureText(text).width;
@@ -270,9 +297,9 @@ export class Whiteboard {
     this.onChange(this.getState());
     return true;
   }
-  getLines() { this.layoutText(); return groupStrokesIntoLines(this.strokes); }
-  draw(context, {width = WIDTH, height = HEIGHT, displayWidth = WIDTH, minLineWidth = 0} = {}) {
-    const sx = width / WIDTH, sy = height / HEIGHT;
+  getLines() { this.layoutText(); return groupStrokesIntoLines(this.strokes, {height: this.height}); }
+  draw(context, {width = WIDTH, height = this.height, displayWidth = WIDTH, minLineWidth = 0} = {}) {
+    const sx = width / WIDTH, sy = height / this.height;
     context.strokeStyle = INK;
     context.fillStyle = INK;
     context.lineCap = 'round';
@@ -302,7 +329,7 @@ export class Whiteboard {
   }
   render() {
     const rect = this.canvas.getBoundingClientRect();
-    const displayWidth = rect.width || WIDTH, displayHeight = rect.height || HEIGHT;
+    const displayWidth = rect.width || WIDTH, displayHeight = rect.height || this.height;
     const scale = Math.min(globalThis.devicePixelRatio || 1, 2, 2400 / displayWidth, 2400 / displayHeight);
     const width = Math.max(1, Math.round(displayWidth * scale));
     const height = Math.max(1, Math.round(displayHeight * scale));

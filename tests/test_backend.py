@@ -82,6 +82,7 @@ class FeedbackTests(unittest.TestCase):
 
 class EndpointTests(unittest.TestCase):
     def setUp(self):
+        main._verified_prefixes.clear()
         self.client = TestClient(app)
 
     def test_health(self):
@@ -140,6 +141,73 @@ class EndpointTests(unittest.TestCase):
             result=self.client.post('/api/analyze',json={'problem':'2(x-3)=10','lines':[{'id':'1','text':'2x-3=10'}]}).json()
         self.assertIn('every term',result['lines'][0]['hint'])
         self.assertNotIn('8',result['lines'][0]['hint'])
+
+    def test_division_and_nested_fraction_steps_stay_local(self):
+        scenarios = [
+            ('Solve x ÷ 2 = 3', ['x ÷ 2 = 3', 'x = 6']),
+            ('Solve (x+1)/2=3', ['(x+1)/(2)=3', 'x+1=6', 'x=5']),
+            ('Solve x/(2/3)=6', ['(x)/((2)/(3))=6', '3x/2=6', 'x=4']),
+            ('Solve (x/2)/3=1', ['((x)/(2))/(3)=1', 'x/6=1', 'x=6']),
+        ]
+        with patch('llm._generate',new_callable=AsyncMock,side_effect=AssertionError('Supported fractions must stay local')) as model:
+            for problem,texts in scenarios:
+                with self.subTest(problem=problem):
+                    result=self.client.post('/api/analyze',json={'problem':problem,'revision':41,
+                        'lines':[{'id':str(i),'text':text} for i,text in enumerate(texts)]}).json()
+                    self.assertEqual([row['status'] for row in result['lines']],['correct']*len(texts))
+                    self.assertTrue(all(row['verifiedBy']=='sympy' for row in result['lines']))
+                    self.assertEqual(result['processingMode'],'local')
+                    self.assertTrue(result['solved'])
+                    self.assertEqual(result['revision'],41)
+        model.assert_not_called()
+
+    def test_wrong_division_step_is_flagged_without_revealing_answer(self):
+        with patch('llm._generate',new_callable=AsyncMock,side_effect=AssertionError('Must stay local')):
+            result=self.client.post('/api/analyze',json={'problem':'x ÷ 2 = 3',
+                'lines':[{'id':'setup','text':'x/2=3'},{'id':'wrong','text':'x=3/2'}]}).json()
+        self.assertEqual([row['status'] for row in result['lines']],['correct','incorrect'])
+        self.assertEqual(result['firstErrorLineId'],'wrong')
+        self.assertFalse(result['solved'])
+        self.assertNotIn('x=6',result['lines'][1]['hint'].replace(' ',''))
+
+    def test_uncertain_fraction_then_student_confirmation_uses_no_more_ai(self):
+        unclear=llm.VisionReading(lines=[llm.VisionRow(id='fraction-step',text='x / ? = 3',confidence=.5)])
+        box={'x':.05,'y':.1,'width':.9,'height':.3}
+        payload={'problem':'x/2=3','revision':51,'image':'data:image/png;base64,aGVsbG8=',
+                 'lines':[{'id':'fraction-step','bbox':box,'fingerprint':'uncertain-fraction-demo'}]}
+        with patch('llm._generate',new_callable=AsyncMock,return_value=unclear) as model:
+            first=self.client.post('/api/analyze',json=payload).json()
+            self.assertEqual(first['lines'][0]['status'],'uncertain')
+            self.assertIsNone(first['firstErrorLineId'])
+            payload['revision']=52
+            payload['lines'][0]['text']='(x)/(2)=3'
+            payload['lines'].append({'id':'answer','text':'x=6'})
+            confirmed=self.client.post('/api/analyze',json=payload).json()
+        model.assert_awaited_once()
+        self.assertEqual([row['status'] for row in confirmed['lines']],['correct','correct'])
+        self.assertEqual(confirmed['lines'][0]['bbox'],box)
+        self.assertEqual(confirmed['lines'][0]['transcriptionConfidence'],1)
+        self.assertTrue(all(row['verifiedBy']=='sympy' for row in confirmed['lines']))
+        self.assertEqual(confirmed['processingMode'],'local')
+        self.assertTrue(confirmed['solved'])
+        self.assertEqual(confirmed['revision'],52)
+
+    def test_one_fraction_row_remains_one_symbolic_step(self):
+        llm._ocr_cache.clear()
+        transcribed=llm.VisionReading(lines=[llm.VisionRow(id='whole-fraction',text='(x+1)/(2)=3',confidence=.99)])
+        box={'x':.05,'y':.1,'width':.9,'height':.4}
+        with patch('llm._generate',new_callable=AsyncMock,return_value=transcribed) as model:
+            response=self.client.post('/api/analyze',json={'problem':'(x+1)/2=3','image':'data:image/png;base64,aGVsbG8=',
+                'lines':[{'id':'whole-fraction','bbox':box,'fingerprint':'whole-fraction-row'}]})
+        self.assertEqual(response.status_code,200)
+        result=response.json()
+        self.assertEqual(len(result['lines']),1)
+        self.assertEqual(result['lines'][0]['id'],'whole-fraction')
+        self.assertEqual(result['lines'][0]['text'],'(x+1)/(2)=3')
+        self.assertEqual(result['lines'][0]['bbox'],box)
+        self.assertEqual(result['lines'][0]['status'],'correct')
+        self.assertEqual(result['lines'][0]['verifiedBy'],'sympy')
+        model.assert_awaited_once()
 
     def test_problem_transcription_is_literal_and_echoes_revision(self):
         literal='Solve 2(x - 3) = 10\nDo not expand first.'
@@ -208,6 +276,9 @@ class ReaderCacheTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ModelSlotTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        main._verified_prefixes.clear()
+
     async def test_supported_typed_math_finishes_while_model_slot_is_held(self):
         slot=asyncio.Semaphore(1)
         request=AnalyzeRequest(problem='2(x-3)=10',lines=[{'id':'1','text':'2x-3=10'}])
@@ -244,6 +315,105 @@ class ModelSlotTests(unittest.IsolatedAsyncioTestCase):
             result=await asyncio.wait_for(task,timeout=1)
         reader.assert_awaited_once()
         self.assertEqual(result['revision'],46)
+
+
+class PrefixCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        main._verified_prefixes.clear()
+        llm._ocr_cache.clear()
+
+    def request(self, texts, problem='2(x-3)=10', revision=1):
+        return AnalyzeRequest(problem=problem,revision=revision,
+            lines=[{'id':str(i+1),'text':text,'fingerprint':f'ink-{i+1}'} for i,text in enumerate(texts)])
+
+    async def test_unchanged_correct_prefix_skips_ocr_and_symbolic_reverification(self):
+        with patch.object(main,'verify_lines',wraps=main.verify_lines) as verify, \
+             patch('llm.read_and_coach',wraps=llm.read_and_coach) as reader, \
+             patch('llm._generate',new_callable=AsyncMock,side_effect=AssertionError('Typed algebra must stay local')) as model:
+            initial=await main.analyze(self.request(['2(x-3)=10','2x-6=10']))
+            repeated=await main.analyze(self.request(['2(x-3)=10','2x-6=10'],revision=2))
+            self.assertEqual(verify.call_count,1)
+            self.assertEqual(reader.call_count,1)
+            extended=await main.analyze(self.request(['2(x-3)=10','2x-6=10','2x=16'],revision=3))
+        self.assertEqual([line['id'] for line in verify.call_args.args[1]],['3'])
+        self.assertEqual(verify.call_args.kwargs['previous_line'],'2x-6=10')
+        self.assertEqual([line['id'] for line in reader.call_args.args[2]],['3'])
+        self.assertEqual([row['status'] for row in initial['lines']],['correct']*2)
+        self.assertEqual([row['status'] for row in repeated['lines']],['correct']*2)
+        self.assertEqual([row['status'] for row in extended['lines']],['correct']*3)
+        self.assertEqual(extended['revision'],3)
+        model.assert_not_called()
+
+    async def test_earlier_text_or_ink_edit_invalidates_its_suffix(self):
+        await main.analyze(self.request(['2(x-3)=10','2x-6=10','2x=16']))
+        with patch.object(main,'verify_lines',wraps=main.verify_lines) as verify:
+            result=await main.analyze(self.request(['2(x-3)=10','x-3=5','2x=16']))
+        self.assertEqual([line['id'] for line in verify.call_args.args[1]],['2','3'])
+        self.assertEqual([row['status'] for row in result['lines']],['correct']*3)
+        changed=self.request(['2(x-3)=10','x-3=5','2x=16'])
+        changed.lines[0].fingerprint='changed-first-ink'
+        with patch.object(main,'verify_lines',wraps=main.verify_lines) as verify:
+            await main.analyze(changed)
+        self.assertEqual([line['id'] for line in verify.call_args.args[1]],['1','2','3'])
+        self.assertNotIn('previous_line',verify.call_args.kwargs)
+
+    async def test_problem_change_invalidates_all_verdicts(self):
+        await main.analyze(self.request(['2(x-3)=10','2x-6=10']))
+        with patch.object(main,'verify_lines',wraps=main.verify_lines) as verify:
+            result=await main.analyze(self.request(['2(x-3)=10','2x-6=10'],problem='2(x-4)=8'))
+        self.assertEqual([line['id'] for line in verify.call_args.args[1]],['1','2'])
+        self.assertTrue(all(row['status']=='correct' for row in result['lines']))
+
+    async def test_accepted_ink_reuses_ocr_and_keeps_current_geometry(self):
+        first=AnalyzeRequest(problem='x/2=3',image='test-image',lines=[
+            {'id':'ink','fingerprint':'stable','bbox':{'x':0,'y':0,'width':1,'height':.5}}])
+        ocr=llm.VisionReading(lines=[llm.VisionRow(id='ink',text='x/2=3',confidence=.99)])
+        with patch('llm._generate',new_callable=AsyncMock,return_value=ocr) as model:
+            await main.analyze(first)
+            expanded=AnalyzeRequest(problem='x/2=3',image='new-composite-image',lines=[
+                {'id':'ink','fingerprint':'stable','bbox':{'x':0,'y':0,'width':1,'height':.25}},
+                {'id':'answer','text':'x=6','number':3}])
+            with patch.object(main,'verify_lines',wraps=main.verify_lines) as verify:
+                result=await main.analyze(expanded)
+        model.assert_awaited_once()
+        self.assertEqual([line['id'] for line in verify.call_args.args[1]],['answer'])
+        self.assertEqual(result['lines'][0]['bbox']['height'],.25)
+        self.assertEqual(result['lines'][1]['number'],3)
+        self.assertTrue(result['solved'])
+
+    async def test_contextual_ai_still_receives_whole_problem_and_prefix(self):
+        judgments=[llm.ContextReading(checks=[llm.ContextCheck(id='1',status='correct',confidence=.99)]),
+                   llm.ContextReading(checks=[llm.ContextCheck(id='2',status='correct',confidence=.99)],solved=True)]
+        with patch('llm._generate',new_callable=AsyncMock,side_effect=judgments) as model:
+            await main.analyze(self.request(['sum = 18'],problem='Find the mean of 4, 6, 8'))
+            result=await main.analyze(self.request(['sum = 18','mean = 6'],problem='Find the mean of 4, 6, 8'))
+        prompt=model.call_args.args[0]
+        context=json.loads(prompt.split('\n')[-1])
+        self.assertEqual(context['problem'],'Find the mean of 4, 6, 8')
+        self.assertEqual([row['id'] for row in context['lines']],['1','2'])
+        self.assertEqual(context['checkOnly'],['2'])
+        self.assertEqual([row['status'] for row in result['lines']],['correct','correct'])
+        self.assertTrue(all(row['verifiedBy']=='ai' for row in result['lines']))
+
+    async def test_uncertain_or_incorrect_rows_never_enter_prefix_cache(self):
+        with patch.object(main,'verify_lines',wraps=main.verify_lines) as verify:
+            for _ in range(2):
+                await main.analyze(self.request(['2x-3=10']))
+        self.assertEqual(verify.call_count,2)
+        self.assertEqual(len(main._verified_prefixes),0)
+        unclear=llm.VisionReading(lines=[llm.VisionRow(id='ink',text='x/?=3',confidence=.4)])
+        with patch('llm._generate',new_callable=AsyncMock,return_value=unclear) as model:
+            for _ in range(2):
+                await main.analyze(AnalyzeRequest(problem='x/2=3',image='test-image',lines=[{'id':'ink','fingerprint':'unclear'}]))
+        self.assertEqual(model.await_count,2)
+        self.assertEqual(len(main._verified_prefixes),0)
+
+    async def test_prefix_cache_is_bounded(self):
+        with patch.object(main,'_PREFIX_CACHE_LIMIT',3):
+            for number in range(4):
+                await main.analyze(self.request(['x=1'],problem=f'x+{number}={number+1}'))
+        self.assertEqual(len(main._verified_prefixes),3)
+        self.assertFalse(any(key[0]=='x+0=1' for key in main._verified_prefixes))
 
 
 class AuthTests(unittest.IsolatedAsyncioTestCase):

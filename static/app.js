@@ -1,4 +1,5 @@
 import { Whiteboard } from './board.js';
+import { SolutionBoard } from './solution-board.js';
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -11,6 +12,11 @@ let problemReviewReady = false;
 let problemMode = 'type';
 let problemRevision = 0;
 let problemReadInFlight = false;
+let problemReadTimer;
+let queuedProblemRead = null;
+let lastProblemAttemptFingerprint = '';
+let lastProblemActivity = 0;
+const problemReadingCache = new Map();
 let resettingProblem = false;
 let subject = 'Math';
 let revision = 0;
@@ -33,6 +39,9 @@ let initializing = true;
 let storageWarned = false;
 const readingOverrides = new Map();
 const readingHistory = new Map();
+let approvedRows = [];
+let approvedProblem = '';
+let approvedProblemVersion = -1;
 let checkClock;
 
 function icon(name) {
@@ -79,7 +88,7 @@ function errorText(error) {
 function save() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    try { localStorage.setItem(storageKey, JSON.stringify({ problem, problemDraft, problemConfirmed, problemReviewReady, problemMode, problemInk: problemBoard.getState(), typedProblem: $('#problem-draft').value, subject, board: board.getState(), messages: messages.slice(-24), readings: [...readingOverrides] })); }
+    try { localStorage.setItem(storageKey, JSON.stringify({ problem, problemDraft, problemConfirmed, problemReviewReady, problemMode, problemInk: problemBoard.getState(), typedProblem: $('#problem-draft').value, subject, board: board.getState(), readings: [...readingOverrides] })); }
     catch {
       $('.autosave').lastChild.textContent = 'Saving unavailable';
       if (!storageWarned) { toast('Browser storage is full or unavailable. Keep this tab open to preserve your board.'); storageWarned = true; }
@@ -116,19 +125,21 @@ function focusConfirmation() {
 function invalidateProblem(fromInk = false) {
   if (initializing || resettingProblem) return;
   problemRevision += 1; problemVersion += 1; revision += 1;
+  lastProblemActivity = Date.now(); clearTimeout(problemReadTimer); queuedProblemRead = null;
   problemConfirmed = false; problemReviewReady = false;
+  approvedRows = [];
   if (fromInk) problemDraft = '';
   analysis = null; pendingRevision = null; clearTimeout(checkTimer);
-  $('#annotations').replaceChildren();
-  $('#problem-confirm-message').textContent = fromInk || problemMode === 'write' ? 'Select Read problem when you finish writing. Then confirm or correct what I read.' : 'Select Review problem to confirm it before checking your solution.';
+  clearSolutionAnnotations();
+  $('#problem-confirm-message').textContent = fromInk || problemMode === 'write' ? 'Pause for two seconds and I’ll read the problem. Then confirm or correct the text.' : 'Select Review problem to confirm it before checking your solution.';
   updateProblem(); renderUpdating(); setFeedbackStatus('Confirm your problem');
   setNote('Confirm your problem before checking these steps.'); save();
 }
-function reviewProblem(text, confidence = 1) {
+function reviewProblem(text, confidence = 1, focus = true) {
   problemDraft = text.trim(); problemReviewReady = true;
   $('#problem-confirm-input').value = problemDraft;
   $('#problem-confirm-message').textContent = !problemDraft ? 'I couldn’t read the problem. Type it here or write it more clearly and try again.' : confidence < .8 ? 'Some handwriting is unclear. Correct the text below before you confirm.' : 'Check the text below. You can correct it before starting.';
-  updateProblem(); save(); focusConfirmation();
+  updateProblem(); save(); if (focus && !problemBoard.isDrawing && !board.isDrawing) focusConfirmation();
 }
 function chooseProblemMode(mode) {
   if (problemMode !== mode) {
@@ -139,13 +150,36 @@ function chooseProblemMode(mode) {
   }
   updateProblem();
   if (mode === 'type') $('#problem-draft').focus();
-  else requestAnimationFrame(() => problemBoard.render());
+  else requestAnimationFrame(() => { problemBoard.render(); scheduleProblemRead(); });
 }
-async function readProblem() {
+function problemFingerprint() {
+  return problemBoard.getLines().map(line => `${line.id}:${line.fingerprint}`).join('|');
+}
+function scheduleProblemRead() {
+  clearTimeout(problemReadTimer);
+  if (problemMode !== 'write' || problemBoard.isDrawing || problemBoard.isEmpty() || !connection.connected || problemConfirmed) return;
+  const snapshot = {revision: problemRevision, fingerprint: problemFingerprint(), manual: false};
+  problemReadTimer = setTimeout(() => {
+    if (problemConfirmed || snapshot.revision !== problemRevision || problemBoard.isDrawing || snapshot.fingerprint !== problemFingerprint()) return;
+    queuedProblemRead = snapshot; runProblemRead();
+  }, Math.max(0, PAUSE_MS - (Date.now() - lastProblemActivity)));
+}
+function readProblem() {
   if (problemReadInFlight || problemBoard.isDrawing || problemBoard.isEmpty()) return;
   if (!connection.connected) { openConnection(); return; }
   invalidateProblem(true);
-  const snapshot = problemRevision;
+  queuedProblemRead = {revision: problemRevision, fingerprint: problemFingerprint(), manual: true};
+  runProblemRead();
+}
+async function runProblemRead() {
+  if (problemReadInFlight || !queuedProblemRead || problemBoard.isDrawing || !connection.connected || problemConfirmed) return;
+  const job = queuedProblemRead; queuedProblemRead = null;
+  if (job.revision !== problemRevision || job.fingerprint !== problemFingerprint() || problemMode !== 'write' || problemBoard.isEmpty()) return;
+  const cached = problemReadingCache.get(job.fingerprint);
+  if (cached && !job.manual) { reviewProblem(cached.text, cached.confidence, false); return; }
+  if (job.fingerprint === lastProblemAttemptFingerprint && !job.manual) return;
+  const snapshot = job.revision;
+  lastProblemAttemptFingerprint = job.fingerprint;
   problemReadInFlight = true;
   const startedAt = Date.now();
   const tick = () => { $('#read-problem span').textContent = `Reading · ${Math.floor((Date.now() - startedAt) / 1000)}s`; };
@@ -154,9 +188,16 @@ async function readProblem() {
   updateProblem();
   try {
     const result = await request('/api/read-problem', {method: 'POST', body: JSON.stringify({image: problemBoard.toDataURL(), revision: snapshot})});
-    if (snapshot !== problemRevision || Number(result.revision) !== snapshot || problemMode !== 'write' || problemBoard.isDrawing) return;
-    reviewProblem(result.text || '', Number(result.confidence));
+    if (Number(result.revision) !== snapshot) return;
+    const reading = {text: result.text || '', confidence: Number(result.confidence)};
+    // Cache the exact ink even when a newer revision superseded this response.
+    // Undo may restore that ink while its request is still in flight.
+    problemReadingCache.set(job.fingerprint, reading);
+    if (problemReadingCache.size > 8) problemReadingCache.delete(problemReadingCache.keys().next().value);
+    if (problemConfirmed || snapshot !== problemRevision || problemMode !== 'write' || problemBoard.isDrawing || job.fingerprint !== problemFingerprint()) return;
+    reviewProblem(reading.text, reading.confidence, job.manual);
   } catch (error) {
+    if (snapshot !== problemRevision && lastProblemAttemptFingerprint === job.fingerprint) lastProblemAttemptFingerprint = '';
     if (snapshot === problemRevision) {
       $('#problem-confirm-message').textContent = `${errorText(error)} You can also switch to Type.`;
       toast('Couldn’t read the problem. Try again or type it.');
@@ -164,6 +205,7 @@ async function readProblem() {
   } finally {
     problemReadInFlight = false; clearInterval(clock);
     $('#read-problem span').textContent = 'Read problem'; updateProblem();
+    if (queuedProblemRead) runProblemRead();
   }
 }
 function setNote(text, checking = false) {
@@ -194,11 +236,47 @@ function requestLines() {
 function canCheck(lines = requestLines()) {
   return problemConfirmed && !!problem && lines.length > 0 && (connection.connected || lines.every(line => typeof line.text === 'string' && line.text.trim()));
 }
+function rowSignature(line) {
+  return JSON.stringify([String(line.id), line.fingerprint || '', line.text || '']);
+}
+function approvedPrefix(lines) {
+  if (!problemConfirmed || approvedProblem !== problem || approvedProblemVersion !== problemVersion) approvedRows = [];
+  let count = 0;
+  while (count < approvedRows.length && lines[count] && rowSignature(lines[count]) === approvedRows[count].signature) count += 1;
+  approvedRows = approvedRows.slice(0, count);
+  return approvedRows;
+}
+function rememberApproved(lines, sentLines) {
+  approvedProblem = problem; approvedProblemVersion = problemVersion;
+  approvedRows = [];
+  for (const source of sentLines) {
+    const result = lines.find(line => String(line.id) === String(source.id));
+    if (!source.fingerprint || result?.status !== 'correct') break;
+    approvedRows.push({signature: rowSignature(source), id: String(source.id), result: {...result}});
+  }
+}
 function pendingReadings(lines) {
-  return lines.map(line => ({...line, status: 'pending', text: line.text || readingHistory.get(String(line.id))?.text || ''}));
+  const approved = approvedPrefix(lines);
+  return lines.map((line, index) => approved[index] ? {...line, ...approved[index].result} : {...line, status: 'pending', text: line.text || readingHistory.get(String(line.id))?.text || ''});
 }
 function unclearReading(line) {
   return !String(line.text || '').trim() || (typeof line.transcriptionConfidence === 'number' && line.transcriptionConfidence < .8);
+}
+function rowNumber(line, index, sentLines) {
+  return sentLines.find(item => String(item.id) === String(line.id))?.number || index + 1;
+}
+function applyReadingOverride(line, source, text, accepted = false) {
+  const current = board.getLines().find(item => String(item.id) === String(line.id));
+  if (!current?.fingerprint || current.fingerprint !== source?.fingerprint) {
+    toast('This line changed. Check its latest reading first.'); return false;
+  }
+  const correction = {text, fingerprint: current.fingerprint, accepted};
+  readingOverrides.set(String(line.id), correction); readingHistory.set(String(line.id), correction);
+  revision += 1; lastActivity = Date.now(); pendingRevision = null; analysis = null;
+  clearTimeout(checkTimer); clearSolutionAnnotations();
+  renderUpdating(); save(); scheduleCheck(true);
+  toast(accepted ? 'Reading confirmed. Checking the math next.' : 'Reading corrected. Your writing stays unchanged.');
+  return true;
 }
 function readingList(lines, sentLines) {
   const list = el('div', 'reading-list');
@@ -206,34 +284,41 @@ function readingList(lines, sentLines) {
   lines.forEach((line, index) => {
     const source = sentLines.find(item => String(item.id) === String(line.id));
     const typed = !!visibleLines.find(item => String(item.id) === String(line.id))?.text;
+    const number = rowNumber(line, index, sentLines);
     const corrected = readingOverrides.get(String(line.id));
     const row = el('div', `reading-row ${line.status || 'pending'}`);
     const heading = el('div', 'reading-heading');
-    const status = line.status === 'correct' ? 'Correct' : line.status === 'incorrect' ? `Check line ${index + 1}` : line.status === 'uncertain' ? (unclearReading(line) ? `Can’t read line ${index + 1}` : 'Needs review') : 'Not checked yet';
-    heading.append(el('span', 'reading-number', String(index + 1)), el('strong', 'reading-status', status));
+    const status = line.status === 'correct' ? 'Correct' : line.status === 'incorrect' ? `Check line ${number}` : line.status === 'uncertain' ? (unclearReading(line) ? `Can’t read line ${number}` : 'Needs review') : 'Not checked yet';
+    heading.append(el('span', 'reading-number', String(number)), el('strong', 'reading-status', status));
     const edit = el('button', 'edit-reading', typed ? 'Edit step' : 'Edit reading');
     edit.type = 'button';
-    edit.setAttribute('aria-label', `${typed ? 'Edit step' : 'Edit reading'} for line ${index + 1}`);
+    edit.setAttribute('aria-label', `${typed ? 'Edit step' : 'Edit reading'} for line ${number}`);
     heading.append(edit);
     const body = el('div', 'reading-body');
     const displayedText = corrected?.text || line.text || '';
     body.append(el('span', 'reading-text', `I read: ${displayedText || 'Not read yet'}`));
-    if (corrected) body.append(el('span', 'reading-corrected', 'Your correction'));
+    if (corrected) body.append(el('span', 'reading-corrected', corrected.accepted ? 'Reading confirmed by you' : 'Your correction'));
     row.append(heading, body);
+    if (line.status === 'uncertain' && !typed && displayedText.trim() && !corrected) {
+      const accept = el('button', 'reading-accept', 'Yes, that’s what I wrote');
+      accept.type = 'button';
+      accept.addEventListener('click', () => applyReadingOverride(line, source, displayedText, true));
+      row.append(accept);
+    }
     edit.addEventListener('click', () => {
       if (body.querySelector('input')) { body.querySelector('input').focus(); return; }
       const form = el('form', 'reading-form');
       const input = el('input');
       input.value = displayedText; input.maxLength = typed ? 180 : 1200; input.required = true;
       input.autocomplete = 'off'; input.spellcheck = false;
-      input.setAttribute('aria-label', `Correct transcription of line ${index + 1}`);
+      input.setAttribute('aria-label', `Correct transcription of line ${number}`);
       input.placeholder = 'Type what you wrote';
       const actions = el('div', 'reading-form-actions');
       const submit = el('button', 'primary-button', typed ? 'Update step' : 'Use reading'); submit.type = 'submit';
       const cancel = el('button', 'text-button', 'Cancel'); cancel.type = 'button';
       cancel.addEventListener('click', () => {
         body.replaceChildren(el('span', 'reading-text', `I read: ${displayedText || 'Not read yet'}`));
-        if (corrected) body.append(el('span', 'reading-corrected', 'Your correction'));
+        if (corrected) body.append(el('span', 'reading-corrected', corrected.accepted ? 'Reading confirmed by you' : 'Your correction'));
       });
       actions.append(submit, cancel); form.append(input, actions); body.replaceChildren(form);
       input.focus(); input.select();
@@ -250,13 +335,7 @@ function readingList(lines, sentLines) {
           else toast('This step could not be updated. Try again.');
           return;
         }
-        const correction = {text, fingerprint: current.fingerprint};
-        readingOverrides.set(String(line.id), correction);
-        readingHistory.set(String(line.id), correction);
-        revision += 1; lastActivity = Date.now(); pendingRevision = null; analysis = null;
-        clearTimeout(checkTimer); $('#annotations').replaceChildren();
-        renderUpdating(); save(); scheduleCheck(true);
-        toast('Reading corrected. Your writing stays unchanged.');
+        applyReadingOverride(line, source, text);
       });
     });
     list.append(row);
@@ -275,7 +354,7 @@ function setTool(tool) {
     $(`#${name}-tool`).classList.toggle('active', name === tool);
     $(`#${name}-tool`).setAttribute('aria-pressed', String(name === tool));
   });
-  $('#drawing-canvas').style.cursor = tool === 'eraser' ? 'cell' : 'crosshair';
+  $('#solution-rows').style.setProperty('--drawing-cursor', tool === 'eraser' ? 'cell' : 'crosshair');
 }
 function changed() {
   if (initializing || resettingProblem) return;
@@ -285,7 +364,7 @@ function changed() {
   clearTimeout(checkTimer);
   analysis = null;
   pruneReadings();
-  $('#annotations').replaceChildren();
+  clearSolutionAnnotations();
   $('#board-empty').hidden = !board.isEmpty();
   $('#recheck-button').disabled = !canCheck() || checkInFlight;
   save();
@@ -297,20 +376,22 @@ function changed() {
   renderUpdating();
   scheduleCheck();
 }
-const board = new Whiteboard($('#drawing-canvas'), {onChange: changed, ariaLabel: 'Solution whiteboard'});
-const problemBoard = new Whiteboard($('#problem-canvas'), {onChange: () => invalidateProblem(true), ariaLabel: 'Problem whiteboard'});
+const board = new SolutionBoard($('#solution-rows'), {onChange: changed});
+const problemBoard = new Whiteboard($('#problem-canvas'), {onChange: () => { invalidateProblem(true); scheduleProblemRead(); }, ariaLabel: 'Problem whiteboard'});
 $('#problem-canvas').addEventListener('boardactivity', event => {
   if (event.detail?.drawing) invalidateProblem(true);
   else updateProblem();
 });
-$('#drawing-canvas').addEventListener('boardactivity', (event) => {
+$('#solution-rows').addEventListener('boardactivity', (event) => {
   if (event.detail?.drawing) {
+    const changedIndex = approvedRows.findIndex(row => row.id === String(event.detail.rowId));
+    if (changedIndex >= 0) approvedRows = approvedRows.slice(0, changedIndex);
     revision += 1;
     lastActivity = Date.now();
     clearTimeout(checkTimer);
     pendingRevision = null;
-    $('#annotations').replaceChildren();
-    if (analysis) { analysis = null; renderUpdating(); }
+    clearSolutionAnnotations();
+    analysis = null; renderUpdating();
     setNote('Write one step per line. Pause to check.');
   } else {
     lastActivity = Date.now();
@@ -319,8 +400,10 @@ $('#drawing-canvas').addEventListener('boardactivity', (event) => {
 });
 function renderUpdating() {
   const lines = requestLines();
+  const readings = pendingReadings(lines);
   const note = el('p', 'checking-note', !problemConfirmed ? 'Confirm the problem on the right before checking your solution.' : canCheck(lines) ? 'Pause for a check, or select Check work.' : 'Type your steps for local math checks, or connect your tutor to read handwriting.');
-  $('#feedback').replaceChildren(note, readingList(pendingReadings(lines), lines));
+  $('#feedback').replaceChildren(note, readingList(readings, lines));
+  renderAnnotations(readings);
 }
 function scheduleCheck(immediate = false) {
   clearTimeout(checkTimer);
@@ -389,6 +472,7 @@ function createCard(type, title, body, iconName) {
 }
 function renderAnalysis(result, sentLines) {
   const lines = Array.isArray(result.lines) ? result.lines : [];
+  rememberApproved(lines, sentLines);
   for (const line of lines) {
     const source = sentLines.find(item => String(item.id) === String(line.id));
     if (source?.fingerprint) readingHistory.set(String(line.id), {text: line.text || '', fingerprint: source.fingerprint});
@@ -402,7 +486,7 @@ function renderAnalysis(result, sentLines) {
     setNote('All steps check out.');
     setFeedbackStatus('Solved');
   } else if (firstError) {
-    const index = lines.indexOf(firstError) + 1;
+    const index = rowNumber(firstError, lines.indexOf(firstError), sentLines);
     const card = createCard('error', `Check line ${index}`, firstError.hint || 'Compare this step with the previous line.', 'info');
     const actions = el('div', 'feedback-actions');
     const hint = el('button', '', 'Show hint 2');
@@ -421,9 +505,9 @@ function renderAnalysis(result, sentLines) {
     setNote(`Take another look at line ${index}`);
     setFeedbackStatus(`Check line ${index}`);
   } else if (uncertain) {
-    const index = lines.indexOf(uncertain) + 1;
+    const index = rowNumber(uncertain, lines.indexOf(uncertain), sentLines);
     const unreadable = unclearReading(uncertain);
-    const card = createCard('uncertain', unreadable ? `Can’t read line ${index}` : `Line ${index} needs review`, unreadable ? 'Check the reading below. Select Edit reading to correct it.' : uncertain.hint || 'Explain this step in the chat so I can check your reasoning.', 'info');
+    const card = createCard('uncertain', unreadable ? `Can’t read line ${index}` : `Line ${index} needs review`, unreadable ? 'Check the reading below. Confirm it if it’s right, or edit it.' : uncertain.hint || 'Explain this step in the chat so I can check your reasoning.', 'info');
     fragment.append(card);
     setNote(unreadable ? 'Check the reading in the tutor panel.' : 'Explain this step to your tutor.');
     setFeedbackStatus(unreadable ? 'Reading needs a correction' : 'Needs review');
@@ -442,35 +526,23 @@ function renderAnalysis(result, sentLines) {
   $('#feedback').replaceChildren(fragment);
   renderAnnotations(lines, firstError, sentLines);
 }
-function renderAnnotations(lines, firstError, sentLines) {
+function clearSolutionAnnotations() {
   $('#annotations').replaceChildren();
-  lines.forEach((line, index) => {
-    const source = sentLines.find((item) => String(item.id) === String(line.id));
-    const box = line.bbox || source?.bbox;
-    if (!box) return;
-    let { x = .08, y = .1 + index * .1, width = .35, height = .07 } = box;
-    if (width > 1 || height > 1 || x > 1 || y > 1) { x /= 1200; width /= 1200; y /= 900; height /= 900; }
-    if (![x, y, width, height].every(Number.isFinite)) return;
-    x = Math.max(0, Math.min(.94, x)); y = Math.max(0, Math.min(.96, y));
-    width = Math.max(.03, Math.min(1 - x, width)); height = Math.max(.025, Math.min(1 - y, height));
-    const number = el('span', 'line-number', String(index + 1));
-    Object.assign(number.style, { left: `${Math.max(.025, x) * 100}%`, top: `${y * 100}%` });
-    $('#annotations').append(number);
-    if (line.status === 'correct') {
-      const mark = el('div', 'line-check'); mark.append(icon('check'));
-      Object.assign(mark.style, { left: `${Math.min(.94, x + width) * 100}%`, top: `${(y + height / 2) * 100}%` });
-      $('#annotations').append(mark);
-    } else if (line.status === 'incorrect' || line.status === 'uncertain') {
-      const highlight = el('div', `line-highlight ${line.status === 'uncertain' ? 'uncertain' : ''}`);
-      Object.assign(highlight.style, { left: `${x * 100}%`, top: `${y * 100}%`, width: `${width * 100}%`, height: `${height * 100}%` });
-      $('#annotations').append(highlight);
-      if (line === firstError) {
-        const badge = el('span', 'line-warning', 'Check this line');
-        const fitsRight = x + width < .7;
-        Object.assign(badge.style, { left: `${(fitsRight ? x + width : x) * 100}%`, top: `${(fitsRight ? y + height / 2 : y + height) * 100}%` });
-        $('#annotations').append(badge);
-      }
-    }
+  $$('#solution-rows .solution-step').forEach(row => row.classList.remove('has-error', 'has-correct', 'has-uncertain'));
+  $$('#solution-rows .row-analysis-badge').forEach(badge => badge.remove());
+}
+function renderAnnotations(lines, firstError) {
+  clearSolutionAnnotations();
+  lines.forEach(line => {
+    const row = board.getRowElement(line.id);
+    if (!row) return;
+    if (line.status === 'correct') row.classList.add('has-correct');
+    else if (line.status === 'incorrect') row.classList.add('has-error');
+    else if (line.status === 'uncertain') row.classList.add('has-uncertain');
+    else return;
+    const label = line.status === 'correct' ? 'Correct' : line === firstError ? 'Check this line' : line.status === 'uncertain' ? 'Needs review' : 'Check this step';
+    const badge = el('span', 'row-analysis-badge', label);
+    row.querySelector('.solution-step-header')?.append(badge);
   });
 }
 function appendMessage(role, content, extraClass = '') {
@@ -532,18 +604,20 @@ function beginProblem(text = '', nextSubject = 'Math') {
   problem = ''; problemDraft = text.trim(); subject = nextSubject;
   problemConfirmed = false; problemReviewReady = false; problemMode = 'type';
   problemVersion += 1; problemRevision += 1; revision += 1;
+  clearTimeout(problemReadTimer); queuedProblemRead = null; lastProblemAttemptFingerprint = ''; problemReadingCache.clear();
   analysis = null; messages = []; pendingRevision = null;
   readingOverrides.clear(); readingHistory.clear();
   clearTimeout(checkTimer);
   resetChat();
   board.setState([]); problemBoard.setState([]);
   $('#problem-draft').value = problemDraft; $('#problem-confirm-input').value = ''; $('#typed-step').value = '';
-  $('#problem-confirm-message').textContent = 'Type your problem and select Review problem, or write it and select Read problem.';
+  $('#problem-confirm-message').textContent = 'Type your problem and select Review problem, or write it and pause for two seconds for an automatic reading.';
   resettingProblem = false;
   updateProblem(); welcome(); save();
   $('#board-empty').hidden = false;
-  $('#annotations').replaceChildren();
+  clearSolutionAnnotations();
   $('#problem-dialog').close(); $('#type-form').hidden = true;
+  $('#board-surface').classList.remove('typing-open');
   setTool('pen');
   setProblemTool('pen');
   openProblem();
@@ -551,6 +625,7 @@ function beginProblem(text = '', nextSubject = 'Math') {
 }
 function toggleTyping(show = $('#type-form').hidden) {
   $('#type-form').hidden = !show;
+  $('#board-surface').classList.toggle('typing-open', show);
   $('#type-tool').classList.toggle('typing', show);
   if (show) $('#typed-step').focus();
 }
@@ -596,6 +671,7 @@ async function refreshStatus() {
         $('#connection-dialog').close(); toast('Your ChatGPT tutor is connected. Let’s work it out.');
       }
       if (!before && !board.isEmpty()) { lastActivity = Date.now(); scheduleCheck(); }
+      if (!before && !problemConfirmed && !problemReviewReady && problemMode === 'write') scheduleProblemRead();
     }
     updateConnectionUI();
   } catch {
@@ -621,6 +697,7 @@ function signIn() {
 $('#pen-tool').addEventListener('click', () => { setTool('pen'); toggleTyping(false); });
 $('#eraser-tool').addEventListener('click', () => setTool('eraser'));
 $('#undo-tool').addEventListener('click', () => board.undo());
+$('#next-line').addEventListener('click', () => { board.addRow(); if (!$('#type-form').hidden) $('#typed-step').focus(); });
 $('#clear-tool').addEventListener('click', () => { if (!board.isEmpty()) $('#clear-dialog').showModal(); });
 $('#confirm-clear').addEventListener('click', () => { board.clear(); $('#clear-dialog').close(); });
 $('#new-problem').addEventListener('click', () => beginProblem());
@@ -676,6 +753,7 @@ $('#problem-confirm-form').addEventListener('submit', event => {
   if (!problemReviewReady || !text) return;
   if (text !== problem) resetChat();
   problem = text; problemDraft = text; problemConfirmed = true;
+  clearTimeout(problemReadTimer); queuedProblemRead = null;
   problemVersion += 1; revision += 1;
   if (problemMode === 'type') $('#problem-draft').value = text;
   updateProblem(); welcome(); save();
@@ -768,11 +846,15 @@ try {
       if (typeof id === 'string' && typeof saved?.text === 'string' && typeof saved?.fingerprint === 'string') readingOverrides.set(id, saved);
     }
     pruneReadings();
-    messages = Array.isArray(stored.messages) ? stored.messages.filter((message) => ['user', 'assistant'].includes(message.role) && typeof message.content === 'string').slice(-24) : [];
-    renderMessages();
+    if (problemMode === 'write' && problemReviewReady && !problemBoard.isEmpty()) {
+      const fingerprint = problemFingerprint();
+      lastProblemAttemptFingerprint = fingerprint;
+      problemReadingCache.set(fingerprint, {text: problemDraft, confidence: 1});
+    }
   }
 } catch { /* A damaged browser save should never stop a fresh workspace. */ }
 initializing = false;
+resetChat();
 updateProblem();
 if (!problemConfirmed) welcome();
 $('#board-empty').hidden = !board.isEmpty();

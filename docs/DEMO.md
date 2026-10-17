@@ -2,13 +2,15 @@
 
 The demo's learning moment is simple: a student distributes incorrectly, the tutor flags that line and asks a useful question, and the student fixes the mistake independently.
 
+Use the preset to set up a predictable problem and rehearse the inputs. Feedback is calculated from the actual current work, not scripted green/red outcomes. Typed algebra uses local verification, so the central mistake-and-correction sequence does not depend on a live AI response.
+
 ## Before presenting
 
 1. Start `python run.py` and leave the terminal running.
 2. Connect ChatGPT from `http://127.0.0.1:8000` on the host laptop. Complete an actual board check; a sign-in indicator alone is insufficient.
 3. If using a tablet, open the printed local network address on the same Wi-Fi. Test with the actual stylus or finger you will use.
-4. Choose **New problem**. In the top **Problem** section, type `Solve 2(x − 3) = 10` and review it. Confirm the text in the tutor panel before starting the separate **Solution** section. You can also handwrite the problem and select **Read problem**, then correct the transcription before confirming.
-5. For the most reliable stage demo, use **Type a step** and press Enter after each equation. Supported algebra is checked locally. For handwriting, use space between rows and allow the two-second pause plus image-reading time. **Check work** can control presentation timing.
+4. Choose **New problem**. In the top **Problem** section, type `Solve 2(x − 3) = 10` and review it, or handwrite it and pause for two seconds. Confirm or correct the reading in the tutor panel before starting the **Solution** section.
+5. For the most reliable stage demo, use **Type a step** and press Enter after each equation. For handwriting, use one numbered row per complete step; **Next line** creates another row. Fractions can grow vertically inside their row. Allow the two-second pause plus image-reading time; **Check work** also controls presentation timing.
 6. Run the complete mistake-and-correction sequence once. Confirm the incorrect highlight disappears after correction. A backup recording, if made, should show a real rehearsal and be identified as a recording.
 
 ## The 90-second story
@@ -58,7 +60,8 @@ Ask in chat: **“Why did the 2 also apply to the 3?”** This is a live AI requ
 | Situation | Action |
 | --- | --- |
 | The problem was misread | Correct the editable problem text in the right panel before confirming. Recognition does not start solution checking automatically. |
-| Handwriting is uncertain | Use **Edit reading** to correct what was recognized, or use **Type a step**. Explain that the tutor asks for clarity rather than guessing. |
+| Handwriting is uncertain | If the shown text matches your writing, select **Yes, that’s what I wrote** to recheck it. Otherwise use **Edit reading** to correct it. Confirming a reading does not declare the mathematics correct. |
+| Old chat distracts from the demo | Refresh the page. Chat clears, while the problem and solution remain saved in this browser. |
 | A response is taking time | The button shows elapsed checking time. Keep the board still, then use **Check work** after the current request finishes. Avoid repeatedly clicking. |
 | The wrong line still appears on the board | Fully erase it or undo it before rewriting. Feedback evaluates all visible rows. |
 | The provider connection fails | Open connection settings on the host laptop. Use the explicitly configured Gemini fallback only if needed; do not present prerecorded or typed feedback as live AI. |

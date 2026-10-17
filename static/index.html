@@ -46,10 +46,10 @@
 
       <div class="board-surface" id="board-surface">
         <div class="paper-margin" aria-hidden="true"></div>
-        <canvas id="drawing-canvas" width="1200" height="900" aria-label="Write each math step on a new line. Use Type a step for keyboard input."></canvas>
-        <div class="annotation-layer" id="annotations" aria-hidden="true"></div>
+        <div id="solution-rows" class="solution-rows" aria-label="Numbered solution lines"></div>
+        <div class="annotation-layer" id="annotations" aria-hidden="true" hidden></div>
         <div class="board-empty" id="board-empty">
-          <h2>Write or type your first step.</h2><p>One step per line. Pause to check.</p>
+          <h2>Write or type in line 1.</h2><p>Use Next line for each new step.</p>
           <div class="empty-actions"><button id="try-example" class="text-button">Try an example <span aria-hidden="true">↗</span></button><span>or</span><button id="empty-type" class="text-button">type a step</button></div>
         </div>
         <div class="board-top-note"><span class="note-dot"></span><span id="board-note">Your space to work it out</span></div>
@@ -58,6 +58,7 @@
           <button id="pen-tool" class="tool-button active" aria-pressed="true" title="Pen (P)"><svg class="icon"><use href="#i-pen"/></svg><span>Pen</span><span class="pen-color"></span></button>
           <button id="eraser-tool" class="tool-button" aria-pressed="false" title="Eraser (E)"><svg class="icon"><use href="#i-eraser"/></svg><span>Eraser</span></button>
           <button id="type-tool" class="tool-button" title="Type a step (T)" aria-label="Type a step"><svg class="icon"><use href="#i-type"/></svg><span>Type a step</span></button>
+          <button id="next-line" class="tool-button next-line" title="Add the next solution line"><svg class="icon"><use href="#i-plus"/></svg><span>Next line</span></button>
           <span class="tool-divider"></span>
           <button id="undo-tool" class="tool-button" title="Undo (Ctrl+Z)" aria-label="Undo"><svg class="icon"><use href="#i-undo"/></svg><span>Undo</span></button>
           <button id="clear-tool" class="tool-button icon-only" title="Clear board" aria-label="Clear board"><svg class="icon"><use href="#i-trash"/></svg></button>
@@ -71,7 +72,7 @@
 
     <aside class="tutor-panel" aria-label="Your AI tutor">
       <div class="tutor-heading"><div class="tutor-avatar"><svg class="icon"><use href="#i-spark"/></svg></div><div><h2>Your tutor</h2><p>Feedback on your current work.</p></div><span class="tutor-live" id="tutor-live">READY</span></div>
-      <section id="problem-confirmation" class="problem-confirmation" aria-label="Confirm your problem"><div class="section-label"><h3>CONFIRM PROBLEM</h3></div><h3>Is this your problem?</h3><p id="problem-confirm-message">Type your problem and select Review problem, or write it and select Read problem.</p><form id="problem-confirm-form"><label class="sr-only" for="problem-confirm-input">Confirm or correct the recognized problem</label><textarea id="problem-confirm-input" rows="3" maxlength="1500" placeholder="Your problem will appear here." hidden></textarea><button type="submit" id="confirm-problem" class="primary-button" disabled>Yes, start solving <svg class="icon"><use href="#i-check"/></svg></button></form></section>
+      <section id="problem-confirmation" class="problem-confirmation" aria-label="Confirm your problem"><div class="section-label"><h3>CONFIRM PROBLEM</h3></div><h3>Is this your problem?</h3><p id="problem-confirm-message">Type your problem and select Review problem, or write it and pause for two seconds for an automatic reading.</p><form id="problem-confirm-form"><label class="sr-only" for="problem-confirm-input">Confirm or correct the recognized problem</label><textarea id="problem-confirm-input" rows="3" maxlength="1500" placeholder="Your problem will appear here." hidden></textarea><button type="submit" id="confirm-problem" class="primary-button" disabled>Yes, start solving <svg class="icon"><use href="#i-check"/></svg></button></form></section>
       <section class="feedback-section" aria-label="Live feedback"><div class="section-label"><h3>LIVE FEEDBACK</h3><span id="feedback-status" class="feedback-status">Waiting for your first step</span></div><div id="feedback" aria-live="polite"><div class="welcome-card"><h4>Start with one step.</h4><p>Type or write on the board. Your checked steps and hints appear here.</p></div></div></section>
       <div class="connection-card" id="connection-card" hidden><div><span class="small-spark"><svg class="icon"><use href="#i-link"/></svg></span><strong>Bring your tutor online</strong></div><p>Connect ChatGPT to get feedback on your work.</p><button id="inline-connect" class="connect-inline">Connect ChatGPT <svg class="icon"><use href="#i-chevron"/></svg></button></div>
       <section class="chat-section" aria-label="Ask your tutor"><div class="section-label chat-label"><h3>ASK YOUR TUTOR</h3><span class="context-badge"><span></span>Board in context</span></div><div id="messages" class="messages" role="log" aria-label="Conversation"><div class="chat-empty" id="chat-empty"><p>Stuck on a step?<br>Let’s think it through together.</p><div class="chat-suggestions"><button data-question="Can you give me a hint for my next step?">Give me a hint <span>↗</span></button><button data-question="Can you explain the last step on my board?">Explain my last step <span>↗</span></button></div></div></div><form id="chat-form" class="chat-form"><label class="sr-only" for="chat-input">Ask about your work</label><textarea id="chat-input" placeholder="Ask about your work…" rows="1" maxlength="2500"></textarea><button id="chat-send" type="submit" aria-label="Send message" title="Send message"><svg class="icon"><use href="#i-arrow"/></svg></button></form><div class="chat-footer"><span>Built for the way you think.</span><span id="verification-label">AI can make mistakes.</span></div></section>

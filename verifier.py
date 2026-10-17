@@ -343,8 +343,8 @@ def _compare(previous, current):
     return "unknown", "The equivalence of these equations could not be established."
 
 
-def verify_lines(problem: str, lines: list[dict]) -> dict:
-    """Check math transitions without exposing the answer in student-facing reasons."""
+def verify_lines(problem: str, lines: list[dict], *, previous_line: str | None = None) -> dict:
+    """Check transitions; previous_line is a server-trusted correct-prefix anchor."""
     if not verifier_available():
         return {"available": False, "engine": "sympy", "results": [
             {"id": line.get("id", index + 1), "status": "unknown", "reason": "Symbolic verification is unavailable."}
@@ -354,6 +354,13 @@ def verify_lines(problem: str, lines: list[dict]) -> dict:
         anchor = _problem(problem)
     except (Unsupported, InvalidMath, ValueError, TypeError, RecursionError):
         anchor = None
+    if previous_line is not None and not isinstance(anchor, DerivativeTask):
+        # Reconstruct the last accepted expression, without checking the prefix again.
+        # Derivatives must retain the original function, not differentiate a prior result.
+        try:
+            anchor = _read(previous_line)
+        except (Unsupported, InvalidMath, ValueError, TypeError, RecursionError):
+            anchor = None
     results = []
     first_error = False
     for index, line in enumerate(lines):

@@ -1,6 +1,8 @@
 """Behavioral regression checks for trustworthy math feedback."""
 import unittest
+from unittest.mock import patch
 
+import verifier
 from verifier import verify_lines, verifier_available
 
 
@@ -35,6 +37,29 @@ class VerifierTests(unittest.TestCase):
 
     def test_division_by_zero_is_rejected(self):
         self.assertEqual(self.statuses("x=4", ["x/0=4/0"]), ["incorrect"])
+
+    def test_division_symbol_and_parenthesized_fraction(self):
+        self.assertEqual(self.statuses("x ÷ 2 = 3", ["(x)/(2)=3", "x=6"]), ["correct", "correct"])
+        self.assertEqual(self.statuses("x/2=3", ["x=3/2"]), ["incorrect"])
+
+    def test_nested_fractions_preserve_numerator_and_denominator_grouping(self):
+        self.assertEqual(self.statuses("x/(2/3)=6", ["(x)/((2)/(3))=6", "3x/2=6", "x=4"]), ["correct"]*3)
+        self.assertEqual(self.statuses("(x/2)/3=1", ["((x)/(2))/(3)=1", "x/6=1", "x=6"]), ["correct"]*3)
+        self.assertEqual(self.statuses("x/(2/3)=6", ["(x/2)/3=6"]), ["incorrect"])
+
+    def test_nested_latex_fraction(self):
+        self.assertEqual(self.statuses("x/(2/3)=6", [r"\frac{x}{\frac{2}{3}}=6", "x=4"]), ["correct", "correct"])
+
+    def test_trusted_prefix_anchor_checks_only_new_transition(self):
+        with patch.object(verifier,'_compare',wraps=verifier._compare) as compare:
+            result=verify_lines('2(x-3)=10',[{'id':'next','text':'x=8'}],previous_line='2x=16')
+        self.assertEqual(compare.call_count,1)
+        self.assertEqual(result['results'][0]['status'],'correct')
+
+    def test_derivative_prefix_keeps_original_function_context(self):
+        result=verify_lines('Differentiate x^3',[{'id':'next','text':"y'=3x^2"}],previous_line="y'=3x^2")
+        self.assertEqual(result['results'][0]['status'],'correct')
+        self.assertEqual(result['results'][0]['reason'],'This derivative matches the original function.')
 
     def test_equivalent_quadratic_and_lost_solution(self):
         self.assertEqual(self.statuses("x^2-1=0", ["(x-1)(x+1)=0", "x=1"]), ["correct", "incorrect"])
