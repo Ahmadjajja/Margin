@@ -8,6 +8,8 @@ import html
 import secrets
 import re
 import hashlib
+import base64
+import binascii
 from collections import OrderedDict
 from pathlib import Path
 from typing import Literal
@@ -47,6 +49,19 @@ class InputLine(BaseModel):
     status: str | None = None
     hint: str | None = None
     fingerprint: str | None = Field(default=None, max_length=200)
+    image: str | None = Field(default=None, max_length=8_500_000, pattern=r"^data:image/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=\r\n]+$")
+
+    @field_validator("image")
+    @classmethod
+    def valid_row_image(cls, value):
+        if value is not None:
+            try:
+                data = base64.b64decode(value.split(",", 1)[1], validate=True)
+                if not 0 < len(data) <= 6_000_000:
+                    raise ValueError("Invalid row image size")
+            except (ValueError, binascii.Error):
+                raise ValueError("Invalid row image") from None
+        return value
 
     @field_validator("id", mode="before")
     @classmethod
@@ -221,12 +236,19 @@ def combine_feedback(request: AnalyzeRequest, reading: llm.BoardReading, verific
         if source.text.strip():
             item["text"] = source.text
             item["transcriptionConfidence"] = 1.0
+            item["readingIssue"] = ""
+        item["readingIssue"] = llm.statement_issue(item["text"]) or item.get("readingIssue", "")
         confidence = min(item["confidence"], item["transcriptionConfidence"])
         verdict = checked.get(source.id, {})
         if first_error:
             item.update(status="pending", hint="", hint2="", errorType="", explanation="Let's revisit the earlier line first.")
         elif uncertain_before:
             item.update(status="pending", hint="", hint2="", errorType="", explanation="Clarify the earlier line so I can check this transition.")
+        elif item["readingIssue"]:
+            item.update(status="uncertain", transcriptionConfidence=min(item["transcriptionConfidence"], .79),
+                        hint="This reading includes more than one statement. Edit it to contain only what is written in this step.",
+                        hint2="", errorType="", explanation="The reading must identify one complete step before its mathematics can be checked.")
+            uncertain_before = True
         elif item["transcriptionConfidence"] < 0.8 or not item["text"].strip():
             item.update(status="uncertain", hint="Could you rewrite or type this line so I can read it clearly?", hint2="", errorType="")
             uncertain_before = True
@@ -276,10 +298,13 @@ def _line_signatures(request: AnalyzeRequest) -> tuple:
     for line in request.lines:
         fingerprint = line.fingerprint or ""
         if not fingerprint and not line.text.strip():
-            if image_hash is None:
-                image_hash = hashlib.sha256((request.image or "").encode()).hexdigest()
-            fingerprint = image_hash + json.dumps(line.bbox.model_dump() if line.bbox else None, sort_keys=True)
-        signatures.append((line.id, fingerprint, line.text))
+            if line.image:
+                fingerprint = hashlib.sha256(line.image.encode()).hexdigest()
+            else:
+                if image_hash is None:
+                    image_hash = hashlib.sha256((request.image or "").encode()).hexdigest()
+                fingerprint = image_hash + json.dumps(line.bbox.model_dump() if line.bbox else None, sort_keys=True)
+        signatures.append((2, line.id, fingerprint, line.text))
     return tuple(signatures)
 
 
@@ -309,7 +334,7 @@ def _cached_prefix(problem: str, signatures: tuple) -> tuple[list, list, bool, b
 def _remember_prefix(request: AnalyzeRequest, signatures: tuple, result: dict, verification: dict) -> None:
     rows = []
     for row in result["lines"]:
-        if row["status"] != "correct" or min(row["confidence"], row["transcriptionConfidence"]) < .8:
+        if row["status"] != "correct" or row.get("readingIssue") or llm.statement_issue(row["text"]) or min(row["confidence"], row["transcriptionConfidence"]) < .8:
             break
         rows.append(row)
     if not rows:
@@ -351,6 +376,8 @@ async def analyze(request: AnalyzeRequest):
     safe_lines = []
     for source in remaining:
         row = read_map.get(source.id)
+        if llm.statement_issue(source.text or (row.text if row else "")) or (not source.text.strip() and row and row.readingIssue):
+            break
         # A low-confidence transcription must never poison symbolic comparisons.
         if not source.text.strip() and (row is None or row.transcriptionConfidence < 0.8):
             break
@@ -376,7 +403,7 @@ async def chat(request: ChatRequest):
     if request.messages[-1].role != "user":
         raise llm.LLMError("Send a message to ask the tutor a question.", 400, "invalid_request")
     async with _analysis_slots:
-        reply = await llm.tutor_chat(request.problem, request.image, [line.model_dump() for line in request.lines], [message.model_dump() for message in request.messages])
+        reply = await llm.tutor_chat(request.problem, request.image, [line.model_dump(exclude={"image"}) for line in request.lines], [message.model_dump() for message in request.messages])
     return {"reply": reply}
 
 

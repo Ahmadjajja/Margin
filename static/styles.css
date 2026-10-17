@@ -47,3 +47,18 @@
 .next-line{color:#6279c9}.board-top-note{max-width:calc(100% - 40px);font-size:9px}.board-top-note #board-note{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 @media(max-width:1100px) and (min-width:761px){.solution-rows{inset:37px 12px 130px}.typing-open .solution-rows{bottom:238px}.board-empty{left:35px;right:30px;top:96px}.type-form{bottom:137px}}
 @media(max-width:760px){.solution-rows{inset:38px 10px 116px}.typing-open .solution-rows{bottom:224px}.solution-step-header{min-height:36px;padding-left:9px}.solution-step-more{min-height:29px}.board-empty{left:32px;right:26px;top:96px}.board-empty h2{font-size:13px}.board-empty p{font-size:10px}.board-toolbar{max-width:calc(100% - 16px)}.tool-button{padding-left:8px;padding-right:8px}.type-form{bottom:124px}.reading-accept{min-height:35px}}
+.reading-issue{display:block;color:#a47d3a;font-size:10px;line-height:1.55;margin-top:6px}.verification-summary{line-height:1.5}
+/* A quiet writing surface keeps the demo focused on the current step. */
+#problem-example,#try-example,.board-empty .empty-actions,.patterns-section,.chat-suggestions,.reading-number,.solution-step-header,.brand-tagline,.subject-tag,.problem-state{display:none!important}
+.board-surface,.solution-step-canvas{background:#fff}
+.solution-rows{padding-left:0;padding-right:0}
+.solution-step,.solution-step.is-active{border:0;border-radius:0;box-shadow:none;background:#fff;margin-bottom:3px}
+.solution-step+.solution-step{border-top:1px solid #f1f3f7}
+.solution-step.has-error{box-shadow:inset 3px 0 #df7e88}.solution-step.has-correct{box-shadow:inset 3px 0 #83bda5}.solution-step.has-uncertain{box-shadow:inset 3px 0 #cfb77e}
+.solution-step.has-error:after,.solution-step.has-correct:after,.solution-step.has-uncertain:after{content:'';position:absolute;inset:0 auto 0 0;width:3px;background:#df7e88;pointer-events:none}.solution-step.has-correct:after{background:#83bda5}.solution-step.has-uncertain:after{background:#cfb77e}
+.problem-confirmed-text{font-family:'Cambria Math','Segoe UI',sans-serif;font-size:21px;color:#35445c;max-height:100px;margin:3px 0 2px;line-height:1.5}
+.problem-section-head{margin-bottom:5px}.problem-draft-actions{justify-content:center}.problem-modes[hidden]{display:none!important}
+.board-empty{top:79px}.board-empty h2{font-size:13px;letter-spacing:0}.board-empty p{font-size:10px}
+.reading-row{border:0;border-radius:0;background:transparent;padding:3px 0}.reading-heading{gap:0}.reading-number{display:none}.reading-list{margin-top:5px}.reading-status{font-size:11px}.reading-body{margin-top:2px}.reading-text{font-size:16px}.edit-reading{border-color:#e7ecf5}.earlier-readings{margin-top:15px;border-top:1px solid #edf1f6;padding-top:10px}.earlier-readings>summary{font-size:10px;color:#8a98af;cursor:pointer;padding:3px 0}.earlier-readings .reading-row+.reading-row{border-top:1px solid #edf1f6;padding-top:10px;margin-top:5px}.verification-summary{font-size:9px;color:#8795ab;margin:7px 0}.chat-empty{padding:0}.messages:has(.chat-empty){min-height:0}.chat-section{min-height:160px}.board-top-note{background:transparent}.board-toolbar{box-shadow:0 3px 12px #34457707}.problem-ink-surface{background:#fff}
+@media(max-width:760px){.problem-confirmed-text{font-size:20px;max-height:100px}.board-empty{top:78px}.chat-section{min-height:190px}.messages:has(.chat-empty){min-height:35px}}
+.chat-footer{display:none}.chat-form{margin-bottom:16px}

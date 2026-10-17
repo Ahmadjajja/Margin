@@ -22,7 +22,8 @@ class MockElement {
       this.className = [...classes].join(' ');
     }};
     this.context = {
-      calls: [], clearRect() {}, beginPath() {}, arc() {}, fill() {},
+      calls: [], clearRect() {}, beginPath() {}, fill() {},
+      arc(...values) { this.calls.push(['arc', ...values]); },
       moveTo(...values) { this.calls.push(['moveTo', ...values]); },
       lineTo(...values) { this.calls.push(['lineTo', ...values]); },
       quadraticCurveTo(...values) { this.calls.push(['quadraticCurveTo', ...values]); },
@@ -43,10 +44,19 @@ class MockElement {
   focus() { this.dispatchEvent({type: 'focus'}); }
   scrollIntoView() {}
   get clientWidth() { return this.getBoundingClientRect().width; }
+  get clientHeight() { return this._height; }
   getBoundingClientRect() {
     const width = this._width || this.parentElement?.getBoundingClientRect().width || 800;
-    const height = parseFloat(this.style.height) || (this.tagName === 'canvas' ? 160 : 600);
-    return {left: 0, top: 0, width, height, bottom: height, right: width};
+    let height = this._height || parseFloat(this.style.height) || (this.tagName === 'canvas' ? 160 : 600);
+    let top = 0;
+    if (this.className.split(' ').includes('solution-step') && this.parentElement?._height) {
+      const siblings = this.parentElement.children;
+      top = siblings.slice(0, siblings.indexOf(this)).reduce((sum, sibling) => sum + parseFloat(sibling.children.find(child => child.tagName === 'canvas').style.height) + 3, 0);
+      height = parseFloat(this.children.find(child => child.tagName === 'canvas').style.height) + 3;
+    } else if (this.tagName === 'canvas' && this.parentElement?.parentElement?._height) {
+      top = this.parentElement.getBoundingClientRect().top;
+    }
+    return {left: 0, top, width, height, bottom: top + height, right: width};
   }
   getContext() { return this.context; }
   setPointerCapture(id) { this.captures.add(id); }
@@ -55,12 +65,13 @@ class MockElement {
   toDataURL() { return 'data:image/png;base64,test'; }
 }
 
-function setup(run, width = 800) {
+function setup(run, width = 800, viewportHeight) {
   const oldDocument = globalThis.document;
   const document = {created: [], createElement(tag) { const node = new MockElement(tag, this); this.created.push(node); return node; }};
   globalThis.document = document;
   const container = document.createElement('div');
   container._width = width;
+  container._height = viewportHeight;
   let changes = 0;
   const board = new SolutionBoard(container, {onChange: () => changes++});
   try { run({board, container, document, changes: () => changes}); }
@@ -204,6 +215,82 @@ test('composite export contains both full rows and normalized boxes match image 
   assert.ok(lines[1].bbox.y > lines[0].bbox.y + lines[0].bbox.height);
 }));
 
+test('a recognition crop draws only the selected row and keeps every fraction component', () => setup(({board, document}) => {
+  board.addText('NEIGHBOR ABOVE');
+  board.addRow();
+  const selected = board.activeRow;
+  selected.board.setState([
+    stroke('numerator', [[350, 35], [390, 65]]),
+    stroke('fraction-bar', [[300, 100], [600, 100]]),
+    stroke('denominator', [[420, 150], [470, 215]]),
+    stroke('division-dot', [[650, 55]]),
+  ]);
+  board.addRow();
+  board.addText('NEIGHBOR BELOW');
+  const before = board.getLines();
+  assert.equal(board.getLineImage(selected.id), 'data:image/png;base64,test');
+  const image = document.created.at(-1);
+  const calls = image.context.calls;
+  assert.deepEqual(calls[0], ['fillRect', '#ffffff', 0, 0, image.width, image.height]);
+  assert.equal(calls.filter(call => call[0] === 'fillText').length, 0, 'neighboring text must never enter a row crop');
+  assert.equal(calls.filter(call => call[0] === 'stroke').length, 3);
+  assert.equal(calls.filter(call => call[0] === 'arc').length, 1, 'division dots are included');
+  assert.equal(calls.filter(call => call[0] === 'moveTo').length, 3);
+  const translate = calls.find(call => call[0] === 'translate');
+  for (const call of calls.filter(call => ['moveTo', 'lineTo', 'arc'].includes(call[0]))) {
+    const x = call[1] + translate[1], y = call[2] + translate[2];
+    assert.ok(x >= 40 && x <= image.width - 40, 'ink keeps generous horizontal padding');
+    assert.ok(y >= 40 && y <= image.height - 40, 'fraction numerator and denominator stay inside the crop');
+  }
+  assert.ok(image.width < 600 && image.height < 400, 'crop excludes unused full-row space');
+  assert.deepEqual(board.getLines(), before, 'crop generation cannot invalidate confirmed reading fingerprints');
+}));
+
+test('row crop includes mixed typed and ink content but never another row drawing', () => setup(({board, document}) => {
+  board.addText('FIRST ROW');
+  board.addRow();
+  const selected = board.activeRow;
+  selected.board.setState([
+    {id: 'typed-part', kind: 'text', text: 'x =', x: 100, y: 100, width: 140},
+    stroke('handwritten-value', [[300, 55], [350, 100]]),
+  ]);
+  board.addRow();
+  board.activeRow.board.setState([stroke('other-row', [[700, 45], [1000, 100]])]);
+  board.getLineImage(selected.id);
+  const calls = document.created.at(-1).context.calls;
+  assert.deepEqual(calls.filter(call => call[0] === 'fillText').map(call => call[2]), ['x =']);
+  assert.equal(calls.filter(call => call[0] === 'stroke').length, 1);
+  assert.ok(calls.find(call => call[0] === 'moveTo')[1] < 500, 'other-row ink is absent');
+}));
+
+test('tall fraction crop preserves proportions under the image size cap', () => setup(({board, document}) => {
+  const row = board.activeRow;
+  for (let index = 0; index < 10; index++) board.expandActiveRow();
+  row.board.setState([
+    stroke('top', [[150, 20], [500, 80]]),
+    stroke('middle', [[100, row.board.height / 2], [700, row.board.height / 2]]),
+    stroke('bottom', [[180, row.board.height - 80], [650, row.board.height - 20]]),
+  ]);
+  board.getLineImage(row.id);
+  const image = document.created.at(-1);
+  assert.ok(image.width <= 1400 && image.height <= 1600);
+  assert.equal(image.height, 1600);
+  const calls = image.context.calls;
+  const first = calls.find(call => call[0] === 'moveTo');
+  const last = calls.filter(call => call[0] === 'lineTo').at(-1);
+  const sx = (last[1] - first[1]) / (650 - 150);
+  const sy = (last[2] - first[2]) / (row.board.height - 40);
+  assert.ok(Math.abs(sx - sy) < 1e-9, 'tall handwriting is uniformly scaled instead of squeezed');
+  assert.equal(calls.filter(call => call[0] === 'stroke').length, 3);
+}, 305));
+
+test('missing or empty row recognition image returns null without creating an image', () => setup(({board, document}) => {
+  const count = document.created.length;
+  assert.equal(board.getLineImage('missing'), null);
+  assert.equal(board.getLineImage(board.activeRowId), null);
+  assert.equal(document.created.length, count);
+}));
+
 test('clearing all rows is undoable and a narrow explicit row still fits typed math', () => setup(({board}) => {
   board.addText('2(x - 3) = 10');
   const fingerprint = board.getLines()[0].fingerprint;
@@ -230,7 +317,7 @@ test('transient padding-only layout cannot inflate typed demo rows after reset o
   for (let i = 0; i < 20; i++) board.render();
   assert.deepEqual(board.getLines().map(line => line.text), ['2(x - 3) = 10', '2x - 6 = 10', '2x = 16', 'x = 8']);
   for (const row of board.rows) {
-    assert.ok(row.canvas.getBoundingClientRect().height >= 160);
+    assert.ok(row.canvas.getBoundingClientRect().height >= 120);
     assert.ok(row.canvas.getBoundingClientRect().height < 200, 'typed rows must not grow from a transient8px layout measurement');
     assert.ok(row.board.height < 350);
   }
@@ -260,3 +347,65 @@ test('oversized saved typed rows recover readable height and text without deleti
     assert.ok(textCall[4] > 30 && textCall[4] < 120, 'recovered text stays visibly inside the row');
   }
 }, 850.667));
+
+test('the initial bare paper is writable near the bottom of the visible viewport', () => setup(({board}) => {
+  const row = board.activeRow;
+  assert.equal(row.canvas.getBoundingClientRect().height, 720);
+  row.canvas.dispatchEvent(pointer('pointerdown', 100, 675));
+  row.canvas.dispatchEvent(pointer('pointermove', 160, 680));
+  row.canvas.dispatchEvent(pointer('pointerup', 160, 680));
+  const point = row.board.getState()[0].points.at(-1);
+  assert.ok(Math.abs(point.y * row.canvas.getBoundingClientRect().height / row.board.height - 680) < 1e-8);
+  assert.equal(board.getLines().length, 1);
+  assert.equal(board.getLines()[0].id, row.id);
+}, 800, 720));
+
+test('Next line compacts prior ink without moving it and fills the remaining paper', () => setup(({board}) => {
+  const first = board.activeRow;
+  first.canvas.dispatchEvent(pointer('pointerdown', 100, 55));
+  first.canvas.dispatchEvent(pointer('pointermove', 140, 80));
+  first.canvas.dispatchEvent(pointer('pointerup', 140, 80));
+  const before = board.getLines()[0];
+  const points = first.board.getState()[0].points;
+  assert.equal(board.addRow(), true);
+  assert.equal(first.canvas.getBoundingClientRect().height, 120);
+  assert.equal(board.activeRow.canvas.getBoundingClientRect().height, 597);
+  assert.equal(board.getLines()[0].fingerprint, before.fingerprint);
+  assert.deepEqual(first.board.getState()[0].points, points);
+  assert.ok(Math.abs(points.at(-1).y * first.canvas.getBoundingClientRect().height / first.board.height - 80) < 1e-8);
+  board.undo();
+  assert.equal(board.rows.length, 1);
+  assert.equal(board.activeRow.canvas.getBoundingClientRect().height, 720);
+  assert.equal(board.getLines()[0].fingerprint, before.fingerprint);
+}, 800, 720));
+
+test('typed additions compact completed rows while preserving text and cache fingerprints', () => setup(({board}) => {
+  board.addText('x + 2 = 5');
+  const before = board.getLines()[0];
+  board.addText('x = 3');
+  assert.equal(board.rows[0].canvas.getBoundingClientRect().height, 120);
+  assert.equal(board.rows[1].canvas.getBoundingClientRect().height, 597);
+  assert.equal(board.getLines()[0].fingerprint, before.fingerprint);
+  const state = board.getState();
+  board.setState(state);
+  assert.equal(board.rows[0].canvas.getBoundingClientRect().height, 120);
+  assert.deepEqual(board.getLines().map(line => line.text), ['x + 2 = 5', 'x = 3']);
+  assert.equal(board.getLines()[0].fingerprint, before.fingerprint);
+}, 800, 720));
+
+test('viewport resizing never compresses or clips existing lower-page handwriting', () => setup(({board, container}) => {
+  const row = board.activeRow;
+  row.canvas.dispatchEvent(pointer('pointerdown', 100, 660));
+  row.canvas.dispatchEvent(pointer('pointermove', 140, 680));
+  row.canvas.dispatchEvent(pointer('pointerup', 140, 680));
+  const before = board.getLines()[0];
+  const points = row.board.getState()[0].points;
+  for (const height of [300, 900, 500]) {
+    container._height = height;
+    board.render();
+    assert.ok(row.canvas.getBoundingClientRect().height >= 712);
+    assert.ok(Math.abs(points.at(-1).y * row.canvas.getBoundingClientRect().height / row.board.height - 680) < 1e-8);
+    assert.equal(board.getLines()[0].fingerprint, before.fingerprint);
+    assert.deepEqual(row.board.getState()[0].points, points);
+  }
+}, 800, 720));

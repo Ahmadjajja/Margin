@@ -32,6 +32,13 @@ class VerifierTests(unittest.TestCase):
     def test_sign_error(self):
         self.assertEqual(self.statuses("x+5=12", ["x=12+5"]), ["incorrect"])
 
+    def test_reported_false_positive_single_step_and_corrected_step(self):
+        original='3(x+2)-4=2x+10'
+        setup=[original,'3x+6-4=2x+10']
+        self.assertEqual(self.statuses(original,setup+['2x+4=2x+10']),['correct','correct','incorrect'])
+        self.assertEqual(self.statuses(original,setup+['3x+2=2x+10']),['correct']*3)
+        self.assertEqual(self.statuses(original,['\n'.join(setup+['2x+4=2x+10'])]),['unknown'])
+
     def test_first_line_is_checked_against_problem(self):
         self.assertEqual(self.statuses("Solve 2(x-3)=10", ["2x-3=10"]), ["incorrect"])
 

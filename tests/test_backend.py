@@ -79,10 +79,20 @@ class FeedbackTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             reading({'confidence':1.2})
 
+    def test_multiple_statements_override_even_confident_correct_verdict(self):
+        compound='3(x+2)-4=2x+10\n3x+6-4=2x+10\n2x+4=2x+10'
+        request=AnalyzeRequest(problem='3(x+2)-4=2x+10',lines=[{'id':'1','text':compound}])
+        result=combine_feedback(request,reading({'text':compound,'status':'correct'},solved=True),
+            {'available':True,'results':[{'id':'1','status':'correct','reason':'Mistaken judgment'}]})
+        self.assertEqual(result['lines'][0]['status'],'uncertain')
+        self.assertEqual(result['lines'][0]['readingIssue'],'multiple_statements')
+        self.assertFalse(result['solved'])
+
 
 class EndpointTests(unittest.TestCase):
     def setUp(self):
         main._verified_prefixes.clear()
+        llm._ocr_cache.clear()
         self.client = TestClient(app)
 
     def test_health(self):
@@ -232,6 +242,53 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code,401)
         self.assertEqual(response.json(),{'error':'Please connect your tutor.','code':'sign_in_required'})
 
+    def test_screenshot_multi_statement_ocr_and_confirmed_text_cannot_be_green(self):
+        problem='Solve 3(x+2)-4=2x+10'
+        compound='3(x+2)-4=2x+10\n3x+6-4=2x+10\n2x+4=2x+10'
+        rows=[{'id':'1','text':'3(x+2)-4=2x+10'}, {'id':'2','text':'3x+6-4=2x+10'},
+              {'id':'3','fingerprint':'screenshot-bad-row','image':'data:image/png;base64,Y3JvcA=='}]
+        ocr=llm.VisionReading(lines=[llm.VisionRow(id='3',text=compound,confidence=.99)])
+        with patch('llm._generate',new_callable=AsyncMock,return_value=ocr) as model:
+            response=self.client.post('/api/analyze',json={'problem':problem,'lines':rows})
+        model.assert_awaited_once()
+        self.assertEqual(response.status_code,200)
+        result=response.json()
+        self.assertEqual([row['status'] for row in result['lines']],['correct','correct','uncertain'])
+        self.assertEqual(result['lines'][2]['readingIssue'],'multiple_statements')
+        self.assertFalse(result['solved'])
+        self.assertEqual(len(llm._ocr_cache),0)
+        self.assertTrue(all(len(key[1])<=2 for key in main._verified_prefixes))
+        rows[2]['text']=compound
+        with patch('llm._generate',new_callable=AsyncMock,side_effect=AssertionError('Malformed confirmed text must not receive AI judgment')) as model:
+            confirmed=self.client.post('/api/analyze',json={'problem':problem,'lines':rows}).json()
+        model.assert_not_called()
+        self.assertEqual(confirmed['lines'][2]['status'],'uncertain')
+        self.assertEqual(confirmed['lines'][2]['readingIssue'],'multiple_statements')
+
+    def test_screenshot_exact_single_bad_and_corrected_third_steps(self):
+        rows=[{'id':'1','text':'3(x+2)-4=2x+10'}, {'id':'2','text':'3x+6-4=2x+10'},
+              {'id':'3','fingerprint':'single-bad-row','image':'data:image/png;base64,Y3JvcA=='}]
+        ocr=llm.VisionReading(lines=[llm.VisionRow(id='3',text='2x+4=2x+10',confidence=.99)])
+        with patch('llm._generate',new_callable=AsyncMock,return_value=ocr) as model:
+            bad=self.client.post('/api/analyze',json={'problem':'Solve 3(x+2)-4=2x+10','lines':rows}).json()
+        model.assert_awaited_once()
+        self.assertEqual([row['status'] for row in bad['lines']],['correct','correct','incorrect'])
+        self.assertEqual(bad['firstErrorLineId'],'3')
+        self.assertEqual(bad['lines'][2]['verifiedBy'],'sympy')
+        rows[2]['text']='3x+2=2x+10'
+        with patch('llm._generate',new_callable=AsyncMock,side_effect=AssertionError('Corrected single statement is local')) as model:
+            good=self.client.post('/api/analyze',json={'problem':'Solve 3(x+2)-4=2x+10','lines':rows}).json()
+        model.assert_not_called()
+        self.assertEqual([row['status'] for row in good['lines']],['correct']*3)
+        self.assertIsNone(good['firstErrorLineId'])
+
+    def test_row_image_validation_rejects_urls_and_invalid_base64(self):
+        for image in ['https://example.com/image.png','data:image/png;base64,a','data:image/png;base64,!!!!']:
+            with patch('llm.read_and_coach',new_callable=AsyncMock) as reader:
+                response=self.client.post('/api/analyze',json={'problem':'x=1','lines':[{'id':'1','image':image}]})
+            self.assertEqual(response.status_code,422)
+            reader.assert_not_called()
+
 
 class ReaderCacheTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -273,6 +330,36 @@ class ReaderCacheTests(unittest.IsolatedAsyncioTestCase):
             result=await llm.read_problem('test-image')
         self.assertEqual(result.text,'')
         self.assertEqual(result.confidence,0)
+
+    async def test_row_crops_are_read_alone_and_serially(self):
+        active=0
+        peak=0
+        images=[]
+        async def generate(prompt,image,**_kwargs):
+            nonlocal active,peak
+            active+=1; peak=max(peak,active); images.append(image)
+            await asyncio.sleep(0)
+            target=json.loads(prompt.split('\nRows: ')[-1])[0]['id']
+            active-=1
+            return llm.VisionReading(lines=[llm.VisionRow(id=target,text='x/2=3' if target=='1' else 'x=6',confidence=.99)])
+        with patch('llm._generate',side_effect=generate) as model:
+            reading=await llm.read_and_coach('x/2=3','FULL BOARD MUST NOT BE SENT',[
+                {'id':'1','fingerprint':'crop-a','image':'CROP A'},
+                {'id':'2','fingerprint':'crop-b','image':'CROP B'}])
+        self.assertEqual(images,['CROP A','CROP B'])
+        self.assertEqual(peak,1)
+        self.assertEqual(model.await_count,2)
+        self.assertEqual([row.text for row in reading.lines],['x/2=3','x=6'])
+
+    async def test_legacy_whole_board_multi_statement_ocr_is_not_cached_or_judged(self):
+        compound='3(x+2)-4=2x+10\n3x+6-4=2x+10\n2x+4=2x+10'
+        ocr=llm.VisionReading(lines=[llm.VisionRow(id='3',text=compound,confidence=1)])
+        with patch('llm._generate',new_callable=AsyncMock,return_value=ocr):
+            result=await llm.read_and_coach('3(x+2)-4=2x+10','legacy-full-board',[{'id':'3','fingerprint':'legacy-third'}])
+        self.assertEqual(result.lines[0].status,'uncertain')
+        self.assertEqual(result.lines[0].readingIssue,'multiple_statements')
+        self.assertEqual(llm.unverified_ids(result,{'results':[]}),[])
+        self.assertEqual(len(llm._ocr_cache),0)
 
 
 class ModelSlotTests(unittest.IsolatedAsyncioTestCase):

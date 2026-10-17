@@ -101,14 +101,15 @@ function updateProblem() {
   $('#problem-state').textContent = problemConfirmed ? 'Confirmed' : 'Draft';
   $('#problem-state').classList.toggle('confirmed', problemConfirmed);
   $('#edit-problem').hidden = !problemConfirmed;
-  $('#problem-type-panel').hidden = problemMode !== 'type';
-  $('#problem-write-panel').hidden = problemMode !== 'write';
+  $('#problem-type-panel').hidden = problemConfirmed || problemMode !== 'type';
+  $('#problem-write-panel').hidden = problemConfirmed || problemMode !== 'write';
+  $('.problem-modes').hidden = problemConfirmed;
   ['type', 'write'].forEach(mode => {
     $(`#problem-${mode}-mode`).classList.toggle('selected', problemMode === mode);
     $(`#problem-${mode}-mode`).setAttribute('aria-pressed', String(problemMode === mode));
   });
   $('#problem-confirmed-text').hidden = !problemConfirmed;
-  $('#problem-confirmed-text').textContent = problemConfirmed ? `Confirmed problem: ${problem}` : '';
+  $('#problem-confirmed-text').textContent = problemConfirmed ? problem : '';
   $('#problem-confirmation').hidden = problemConfirmed;
   $('#problem-confirm-input').hidden = !problemReviewReady;
   $('#confirm-problem').disabled = !problemReviewReady || !problemDraft.trim();
@@ -233,6 +234,14 @@ function requestLines() {
     return correction ? {...line, text: correction.text} : line;
   });
 }
+function analysisLines(lines) {
+  return lines.map(line => {
+    if (typeof line.text === 'string' && line.text.trim()) return line;
+    const image = board.getLineImage(line.id);
+    if (!image) throw new Error('A handwritten step could not be captured. Try checking again, or edit its reading.');
+    return {...line, image};
+  });
+}
 function canCheck(lines = requestLines()) {
   return problemConfirmed && !!problem && lines.length > 0 && (connection.connected || lines.every(line => typeof line.text === 'string' && line.text.trim()));
 }
@@ -260,12 +269,25 @@ function pendingReadings(lines) {
   return lines.map((line, index) => approved[index] ? {...line, ...approved[index].result} : {...line, status: 'pending', text: line.text || readingHistory.get(String(line.id))?.text || ''});
 }
 function unclearReading(line) {
-  return !String(line.text || '').trim() || (typeof line.transcriptionConfidence === 'number' && line.transcriptionConfidence < .8);
+  return !!line.readingIssue || !String(line.text || '').trim() || (typeof line.transcriptionConfidence === 'number' && line.transcriptionConfidence < .8);
+}
+function verificationSummary(lines, processingMode) {
+  const decisive = lines.filter(line => ['correct', 'incorrect'].includes(line.status));
+  const local = decisive.filter(line => line.verifiedBy === 'sympy').length;
+  const ai = decisive.filter(line => line.verifiedBy === 'ai').length;
+  const unresolved = lines.length - local - ai;
+  if (local && local === lines.length) return processingMode === 'local' ? 'Checked locally with symbolic math' : 'Every step checked with symbolic math';
+  const parts = [];
+  if (local) parts.push(`${local} ${local === 1 ? 'step' : 'steps'} checked with symbolic math`);
+  if (ai) parts.push(`${ai} ${ai === 1 ? 'step' : 'steps'} reviewed by AI`);
+  if (unresolved) parts.push(`${unresolved} ${unresolved === 1 ? 'step awaits' : 'steps await'} verification`);
+  return parts.join('; ');
 }
 function rowNumber(line, index, sentLines) {
   return sentLines.find(item => String(item.id) === String(line.id))?.number || index + 1;
 }
 function applyReadingOverride(line, source, text, accepted = false) {
+  if (accepted && line.readingIssue) { toast('Edit the reading to contain only this step before checking it.'); return false; }
   const current = board.getLines().find(item => String(item.id) === String(line.id));
   if (!current?.fingerprint || current.fingerprint !== source?.fingerprint) {
     toast('This line changed. Check its latest reading first.'); return false;
@@ -288,7 +310,7 @@ function readingList(lines, sentLines) {
     const corrected = readingOverrides.get(String(line.id));
     const row = el('div', `reading-row ${line.status || 'pending'}`);
     const heading = el('div', 'reading-heading');
-    const status = line.status === 'correct' ? 'Correct' : line.status === 'incorrect' ? `Check line ${number}` : line.status === 'uncertain' ? (unclearReading(line) ? `Can’t read line ${number}` : 'Needs review') : 'Not checked yet';
+    const status = line.status === 'correct' ? 'Correct' : line.status === 'incorrect' ? 'Check this step' : line.status === 'uncertain' ? (unclearReading(line) ? 'Check this reading' : 'Needs review') : 'Not checked yet';
     heading.append(el('span', 'reading-number', String(number)), el('strong', 'reading-status', status));
     const edit = el('button', 'edit-reading', typed ? 'Edit step' : 'Edit reading');
     edit.type = 'button';
@@ -298,8 +320,9 @@ function readingList(lines, sentLines) {
     const displayedText = corrected?.text || line.text || '';
     body.append(el('span', 'reading-text', `I read: ${displayedText || 'Not read yet'}`));
     if (corrected) body.append(el('span', 'reading-corrected', corrected.accepted ? 'Reading confirmed by you' : 'Your correction'));
+    if (line.readingIssue) body.append(el('span', 'reading-issue', 'This reading may include more than one step. Edit it to match only this line.'));
     row.append(heading, body);
-    if (line.status === 'uncertain' && !typed && displayedText.trim() && !corrected) {
+    if (line.status === 'uncertain' && !line.readingIssue && !typed && displayedText.trim() && !corrected) {
       const accept = el('button', 'reading-accept', 'Yes, that’s what I wrote');
       accept.type = 'button';
       accept.addEventListener('click', () => applyReadingOverride(line, source, displayedText, true));
@@ -326,6 +349,7 @@ function readingList(lines, sentLines) {
         event.preventDefault();
         const text = input.value.trim();
         if (!text) return;
+        if (line.readingIssue && text === displayedText.trim()) { toast('Correct the reading so it contains only this step.'); input.focus(); return; }
         const current = board.getLines().find(item => String(item.id) === String(line.id));
         if (!current?.fingerprint || current.fingerprint !== source?.fingerprint) {
           toast('This line changed. Check your latest work before editing its reading.'); return;
@@ -341,6 +365,19 @@ function readingList(lines, sentLines) {
     list.append(row);
   });
   return list;
+}
+function focusedReadings(lines, sentLines) {
+  const wrapper = el('div', 'reading-review');
+  if (!lines.length) return wrapper;
+  const current = lines.find(line => line.status === 'incorrect' || line.status === 'uncertain') || lines.at(-1);
+  wrapper.append(readingList([current], sentLines));
+  const earlier = lines.filter(line => line !== current);
+  if (earlier.length) {
+    const details = el('details', 'earlier-readings');
+    details.append(el('summary', '', 'Review all readings'), readingList(earlier, sentLines));
+    wrapper.append(details);
+  }
+  return wrapper;
 }
 const welcomeTemplate = $('#feedback').innerHTML;
 function welcome() {
@@ -402,7 +439,7 @@ function renderUpdating() {
   const lines = requestLines();
   const readings = pendingReadings(lines);
   const note = el('p', 'checking-note', !problemConfirmed ? 'Confirm the problem on the right before checking your solution.' : canCheck(lines) ? 'Pause for a check, or select Check work.' : 'Type your steps for local math checks, or connect your tutor to read handwriting.');
-  $('#feedback').replaceChildren(note, readingList(readings, lines));
+  $('#feedback').replaceChildren(note, focusedReadings(readings, lines));
   renderAnnotations(readings);
 }
 function scheduleCheck(immediate = false) {
@@ -437,7 +474,7 @@ async function runPendingCheck() {
   const sentLines = requestLines();
   try {
     const result = await request('/api/analyze', {
-      method: 'POST', body: JSON.stringify({ problem, image: board.toDataURL(), lines: sentLines, revision: snapshot }),
+      method: 'POST', body: JSON.stringify({ problem, image: null, lines: analysisLines(sentLines), revision: snapshot }),
     });
     if (snapshot !== revision || board.isDrawing || (result.revision !== undefined && Number(result.revision) !== snapshot)) return;
     analysis = result;
@@ -452,7 +489,7 @@ async function runPendingCheck() {
     retry.addEventListener('click', () => scheduleCheck(true));
     card.append(retry);
     const latestLines = requestLines();
-    $('#feedback').replaceChildren(card, readingList(pendingReadings(latestLines), latestLines));
+    $('#feedback').replaceChildren(card, focusedReadings(pendingReadings(latestLines), latestLines));
   } finally {
     checkInFlight = false;
     clearInterval(checkClock);
@@ -487,7 +524,7 @@ function renderAnalysis(result, sentLines) {
     setFeedbackStatus('Solved');
   } else if (firstError) {
     const index = rowNumber(firstError, lines.indexOf(firstError), sentLines);
-    const card = createCard('error', `Check line ${index}`, firstError.hint || 'Compare this step with the previous line.', 'info');
+    const card = createCard('error', 'Check this step', firstError.hint || 'Compare this step with the previous line.', 'info');
     const actions = el('div', 'feedback-actions');
     const hint = el('button', '', 'Show hint 2');
     const why = el('button', '', 'Why?');
@@ -502,12 +539,12 @@ function renderAnalysis(result, sentLines) {
     why.addEventListener('click', () => reveal(firstError.explanation, `Why is line ${index} incorrect? Explain the underlying idea without solving the problem for me.`, why));
     dismiss.addEventListener('click', () => { card.remove(); toast('Hint dismissed. Your tutor will check again when you write.'); });
     actions.append(hint, why, dismiss); card.append(actions); fragment.append(card);
-    setNote(`Take another look at line ${index}`);
-    setFeedbackStatus(`Check line ${index}`);
+    setNote('Take another look at the highlighted step.');
+    setFeedbackStatus('Check this step');
   } else if (uncertain) {
     const index = rowNumber(uncertain, lines.indexOf(uncertain), sentLines);
     const unreadable = unclearReading(uncertain);
-    const card = createCard('uncertain', unreadable ? `Can’t read line ${index}` : `Line ${index} needs review`, unreadable ? 'Check the reading below. Confirm it if it’s right, or edit it.' : uncertain.hint || 'Explain this step in the chat so I can check your reasoning.', 'info');
+    const card = createCard('uncertain', unreadable ? 'Check this reading' : 'This step needs review', uncertain.readingIssue ? 'The reading may combine separate steps. Edit it below to contain only this line.' : unreadable ? 'Check the reading below. Confirm it if it’s right, or edit it.' : uncertain.hint || 'Explain this step in the chat so I can check your reasoning.', 'info');
     fragment.append(card);
     setNote(unreadable ? 'Check the reading in the tutor panel.' : 'Explain this step to your tutor.');
     setFeedbackStatus(unreadable ? 'Reading needs a correction' : 'Needs review');
@@ -515,14 +552,14 @@ function renderAnalysis(result, sentLines) {
     setNote(correct.length ? 'Correct. Add your next step.' : 'Ready for your next step');
     setFeedbackStatus(correct.length ? `${correct.length} ${correct.length === 1 ? 'step' : 'steps'} checked` : 'Keep going');
   }
-  if (correct.length && !result.solved && !firstError && !uncertain) fragment.append(createCard('success', 'Correct', 'Add your next step.', 'check'));
-  if (!fragment.childNodes.length) fragment.append(createCard('neutral', 'Add a step', 'Write or type a complete math step.', 'pen'));
-  if (lines.some(line => line.verifiedBy === 'sympy')) {
-    const verified = el('div', 'verified-label verification-summary', result.processingMode === 'local' ? 'Checked locally with symbolic math' : 'Math checked with symbolic verification');
-    verified.prepend(icon('check')); fragment.append(verified);
+  if (!lines.length) fragment.append(createCard('neutral', 'Add a step', 'Write or type a complete math step.', 'pen'));
+  const verification = verificationSummary(lines, result.processingMode);
+  if (verification) {
+    const verified = el('div', 'verified-label verification-summary', verification);
+    fragment.append(verified);
   }
   if (result.processingMode === 'local') setFeedbackStatus('Local math check');
-  fragment.append(readingList(lines, sentLines));
+  fragment.append(focusedReadings(lines, sentLines));
   $('#feedback').replaceChildren(fragment);
   renderAnnotations(lines, firstError, sentLines);
 }
@@ -701,7 +738,7 @@ $('#next-line').addEventListener('click', () => { board.addRow(); if (!$('#type-
 $('#clear-tool').addEventListener('click', () => { if (!board.isEmpty()) $('#clear-dialog').showModal(); });
 $('#confirm-clear').addEventListener('click', () => { board.clear(); $('#clear-dialog').close(); });
 $('#new-problem').addEventListener('click', () => beginProblem());
-$('#edit-problem').addEventListener('click', openProblem);
+$('#edit-problem').addEventListener('click', () => { invalidateProblem(); openProblem(); });
 $('#type-tool').addEventListener('click', () => toggleTyping());
 $('#empty-type').addEventListener('click', () => toggleTyping(true));
 $('#close-type').addEventListener('click', () => toggleTyping(false));
@@ -814,13 +851,6 @@ document.addEventListener('keydown', (event) => {
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshStatus(); });
 window.addEventListener('message', (event) => { if (event.origin === location.origin && ['margin-auth-complete', 'margin-auth'].includes(event.data?.type)) refreshStatus(); });
 
-// Keep upcoming features visibly separate from this demo's working tutor.
-const patterns = el('section', 'patterns-section');
-patterns.setAttribute('aria-label', 'Your patterns this session, coming later');
-const patternsHeading = el('div', 'section-label');
-patternsHeading.append(el('h3', '', 'YOUR PATTERNS THIS SESSION'), el('span', 'future-badge', 'COMING LATER'));
-patterns.append(patternsHeading, el('p', '', 'Personalized practice, built around how you learn.'));
-$('.chat-section').insertBefore(patterns, $('#chat-form'));
 $('.api-help summary').textContent = 'Using Gemini as a fallback?';
 $('.api-help p').innerHTML = 'Add your Gemini key as <code>LLM_API_KEY</code> in the local server’s <code>.env</code> file, then check the connection again. Provider billing is separate from ChatGPT. Never paste a key into the whiteboard or chat.';
 $('#problem-dialog form > p').textContent = 'Enter the problem, then type or write one step at a time.';

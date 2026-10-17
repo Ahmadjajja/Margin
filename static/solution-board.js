@@ -2,6 +2,7 @@ import {Whiteboard, groupStrokesIntoLines, summarizeStrokes} from './board.js';
 
 const WIDTH = 1200;
 const INITIAL_HEIGHT = 160;
+const COMPACT_HEIGHT = 120;
 const GROW_BY = 100;
 const MAX_ROW_HEIGHT = 1100;
 const MIN_LAYOUT_WIDTH = 160;
@@ -29,6 +30,7 @@ export class SolutionBoard {
     this.mutating = false;
     this.lastWidth = 800;
     this._createRow();
+    this._fillLastRow();
     if (typeof ResizeObserver !== 'undefined') {
       this.resizeObserver = new ResizeObserver(() => this.render());
       this.resizeObserver.observe(container);
@@ -78,9 +80,10 @@ export class SolutionBoard {
     const minHeight = INITIAL_HEIGHT * WIDTH / width;
     const maximumHeight = MAX_ROW_HEIGHT * WIDTH / width;
     const requestedHeight = Number.isFinite(saved.height) && saved.height > 0 ? saved.height : minHeight;
+    const minimumSavedHeight = Number.isFinite(saved.height) ? COMPACT_HEIGHT * WIDTH / width : minHeight;
     const oversized = requestedHeight > maximumHeight;
     const onlyText = Array.isArray(saved.strokes) && saved.strokes.every(stroke => stroke.kind === 'text');
-    const height = oversized && onlyText ? minHeight : Math.max(minHeight, Math.min(requestedHeight, maximumHeight));
+    const height = oversized && onlyText ? minHeight : Math.max(minimumSavedHeight, Math.min(requestedHeight, maximumHeight));
     let savedStrokes = saved.strokes;
     if (oversized && Array.isArray(savedStrokes)) {
       savedStrokes = clone(savedStrokes);
@@ -159,11 +162,41 @@ export class SolutionBoard {
     const previousHeight = rect.height || parseFloat(row.canvas.style.height) || INITIAL_HEIGHT;
     const nextHeight = Math.min(MAX_ROW_HEIGHT, previousHeight + amount);
     if (nextHeight <= previousHeight) return false;
+    return this._setRowHeight(row, nextHeight);
+  }
+
+  _setRowHeight(row, nextHeight) {
+    const previousHeight = row.canvas.getBoundingClientRect().height || parseFloat(row.canvas.style.height) || INITIAL_HEIGHT;
+    if (!Number.isFinite(nextHeight) || nextHeight <= 0 || Math.abs(nextHeight - previousHeight) < .5) return false;
     // Increase the coordinate extent by the same ratio as the CSS canvas.
     // Existing points therefore stay at the exact same screen positions.
     row.canvas.style.height = `${nextHeight}px`;
     row.board.setLogicalHeight(row.board.height * nextHeight / previousHeight);
     return true;
+  }
+
+  _inkBottom(row) {
+    row.board.layoutText();
+    const summary = summarizeStrokes(row.board.strokes, {id: row.id, height: row.board.height});
+    return summary ? summary.bounds.bottom * row.canvas.getBoundingClientRect().height / row.board.height : 0;
+  }
+
+  _compactRow(row) {
+    if (!row || row.board.isEmpty()) return;
+    const currentHeight = row.canvas.getBoundingClientRect().height;
+    this._setRowHeight(row, Math.min(currentHeight, Math.max(COMPACT_HEIGHT, this._inkBottom(row) + 32)));
+  }
+
+  _fillLastRow() {
+    const row = this.rows.at(-1);
+    const viewportHeight = this.container.clientHeight;
+    if (!row || !Number.isFinite(viewportHeight) || viewportHeight < INITIAL_HEIGHT) return;
+    const top = row.canvas.getBoundingClientRect().top - this.container.getBoundingClientRect().top;
+    const padding = typeof getComputedStyle === 'function' ? parseFloat(getComputedStyle(this.container).paddingBottom) || 0 : 0;
+    const available = viewportHeight - top - padding;
+    // Fill the visible paper, but retain every existing point when the viewport shrinks.
+    const nextHeight = Math.min(MAX_ROW_HEIGHT, Math.max(INITIAL_HEIGHT, available, this._inkBottom(row) + 32));
+    this._setRowHeight(row, nextHeight);
   }
 
   expandActiveRow() {
@@ -186,13 +219,16 @@ export class SolutionBoard {
     if (this.isDrawing) return false;
     const last = this.rows.at(-1);
     if (last?.board.isEmpty()) {
+      this._fillLastRow();
       this._activate(last, true);
       last.canvas.focus?.({preventScroll: true});
       return true;
     }
     if (this.rows.length >= MAX_ROWS) return false;
     this._remember();
+    this._compactRow(last);
     const row = this._createRow();
+    this._fillLastRow();
     this._activate(row, true);
     row.canvas.focus?.({preventScroll: true});
     this._notify();
@@ -207,7 +243,9 @@ export class SolutionBoard {
     let row = this.activeRow;
     if (!row || !row.board.isEmpty()) {
       if (this.rows.length >= MAX_ROWS) return false;
+      this._compactRow(this.rows.at(-1));
       row = this._createRow();
+      this._fillLastRow();
     }
     this.mutating = true;
     let success;
@@ -304,13 +342,14 @@ export class SolutionBoard {
       if (!this.rows.length) this._createRow();
     } finally { this.mutating = false; }
     this._activate(this.rows.find(row => row.id === saved.activeRowId) || this.rows.at(-1));
+    this._fillLastRow();
     return true;
   }
 
   render() {
     const width = this._width();
     for (const row of this.rows) {
-      const minimumHeight = INITIAL_HEIGHT * WIDTH / width;
+      const minimumHeight = (row === this.rows.at(-1) ? INITIAL_HEIGHT : COMPACT_HEIGHT) * WIDTH / width;
       const maximumHeight = MAX_ROW_HEIGHT * WIDTH / width;
       let logicalHeight = Math.max(row.board.height, minimumHeight);
       if (logicalHeight > maximumHeight) {
@@ -326,6 +365,7 @@ export class SolutionBoard {
       row.canvas.style.height = `${logicalHeight * width / WIDTH}px`;
       row.board.setLogicalHeight(logicalHeight);
     }
+    this._fillLastRow();
   }
 
   _exportLayout() {
@@ -350,6 +390,42 @@ export class SolutionBoard {
       const bbox = {x: box.x, y: (y + box.y * height) / layout.height, width: box.width, height: box.height * height / layout.height};
       return {id: row.id, fingerprint: summary.fingerprint, number, ...(summary.text !== undefined ? {text: summary.text} : {}), bbox, y: bbox.y + bbox.height / 2};
     });
+  }
+
+  /** A recognition image contains exactly one explicit step, including all fraction levels. */
+  getLineImage(id) {
+    const row = this.rows.find(item => item.id === String(id));
+    if (!row || row.board.isEmpty()) return null;
+    row.board.layoutText();
+    const summary = summarizeStrokes(row.board.strokes, {id: row.id, height: row.board.height});
+    if (!summary) return null;
+    const rect = row.canvas.getBoundingClientRect();
+    const displayWidth = rect.width >= MIN_LAYOUT_WIDTH ? rect.width : this._width();
+    const displayHeight = rect.height > 0 ? rect.height : row.board.height * displayWidth / WIDTH;
+    const sx = displayWidth / WIDTH, sy = displayHeight / row.board.height;
+    const {left, top, right, bottom} = summary.bounds;
+    const inkWidth = Math.max(0, (right - left) * sx);
+    const inkHeight = Math.max(0, (bottom - top) * sy);
+    const padding = Math.max(24, Math.min(48, Math.max(inkWidth, inkHeight) * .08));
+    // Allow the white margin to extend beyond the canvas edges: edge strokes,
+    // division dots and descenders must not be clipped by the crop.
+    const cropWidth = Math.max(80, inkWidth + padding * 2);
+    const cropHeight = Math.max(72, inkHeight + padding * 2);
+    const cropX = (left + right) * sx / 2 - cropWidth / 2;
+    const cropY = (top + bottom) * sy / 2 - cropHeight / 2;
+    const scale = Math.min(2, 1400 / cropWidth, 1600 / cropHeight);
+    const output = document.createElement('canvas');
+    output.width = Math.max(1, Math.round(cropWidth * scale));
+    output.height = Math.max(1, Math.round(cropHeight * scale));
+    const context = output.getContext('2d');
+    if (!context) return null;
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, output.width, output.height);
+    context.save();
+    context.translate(-cropX * scale, -cropY * scale);
+    row.board.draw(context, {width: displayWidth * scale, height: displayHeight * scale, displayWidth, minLineWidth: 2.5});
+    context.restore();
+    return output.toDataURL('image/png');
   }
 
   toDataURL() {
