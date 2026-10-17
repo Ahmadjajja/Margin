@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 import llm
+import main
 from main import AnalyzeRequest, combine_feedback, app
 from auth import ChatGPTAuth, AuthError
 import jwt
@@ -117,6 +118,132 @@ class EndpointTests(unittest.TestCase):
         response=self.client.get('/auth/callback?state=nonexistent&code=fake')
         self.assertEqual(response.status_code,400)
         self.assertIn('expired',response.text)
+
+    def test_typed_demo_is_local_and_correction_solves_immediately(self):
+        scenarios = [(['2(x-3)=10'], ['correct'], False),
+                     (['2(x-3)=10','2x-3=10'], ['correct','incorrect'], False),
+                     (['2(x-3)=10','2x-6=10','2x=16','x=8'], ['correct']*4, True)]
+        with patch('llm._generate', new_callable=AsyncMock, side_effect=AssertionError('Typed algebra must not call AI')) as model:
+            for texts, expected, solved in scenarios:
+                started=time.perf_counter()
+                response=self.client.post('/api/analyze', json={'problem':'Solve 2(x-3)=10','lines':[{'id':str(i),'text':text} for i,text in enumerate(texts)]})
+                duration=time.perf_counter()-started
+                self.assertEqual(response.status_code,200)
+                self.assertEqual([row['status'] for row in response.json()['lines']],expected)
+                self.assertTrue(all(row['verifiedBy']=='sympy' for row in response.json()['lines']))
+                self.assertEqual(response.json()['solved'],solved)
+                self.assertLess(duration,1.0)
+        model.assert_not_called()
+
+    def test_distribution_hint_is_specific_without_answer(self):
+        with patch('llm._generate', new_callable=AsyncMock, side_effect=AssertionError('Must stay local')):
+            result=self.client.post('/api/analyze',json={'problem':'2(x-3)=10','lines':[{'id':'1','text':'2x-3=10'}]}).json()
+        self.assertIn('every term',result['lines'][0]['hint'])
+        self.assertNotIn('8',result['lines'][0]['hint'])
+
+    def test_problem_transcription_is_literal_and_echoes_revision(self):
+        literal='Solve 2(x - 3) = 10\nDo not expand first.'
+        with patch('llm.read_problem',new_callable=AsyncMock,return_value=llm.ProblemReading(text=literal,confidence=.96)) as reader, \
+             patch.object(main,'verify_lines',side_effect=AssertionError('Problem input must never be solved')):
+            response=self.client.post('/api/read-problem',json={'image':'data:image/png;base64,aGVsbG8=','revision':981})
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(response.json(),{'text':literal,'confidence':.96,'revision':981})
+        reader.assert_awaited_once()
+
+    def test_problem_image_and_revision_validation(self):
+        for payload in [{}, {'image':'https://example.com/image.png','revision':1},
+                        {'image':'data:image/png;base64,aGVsbG8=','revision':-1}]:
+            with patch('llm.read_problem',new_callable=AsyncMock) as reader:
+                response=self.client.post('/api/read-problem',json=payload)
+            self.assertEqual(response.status_code,422)
+            reader.assert_not_called()
+
+    def test_problem_provider_errors_use_existing_safe_contract(self):
+        with patch('llm.read_problem',new_callable=AsyncMock,side_effect=llm.LLMError('Please connect your tutor.',401,'sign_in_required')):
+            response=self.client.post('/api/read-problem',json={'image':'data:image/png;base64,aGVsbG8=','revision':2})
+        self.assertEqual(response.status_code,401)
+        self.assertEqual(response.json(),{'error':'Please connect your tutor.','code':'sign_in_required'})
+
+
+class ReaderCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        llm._ocr_cache.clear()
+
+    async def test_unchanged_ink_reuses_reading_but_changed_fingerprint_rechecks(self):
+        result=llm.VisionReading(lines=[llm.VisionRow(id='1',text='2x-3=10',confidence=.99)])
+        with patch('llm._generate', new_callable=AsyncMock, return_value=result) as model:
+            first=await llm.read_and_coach('2(x-3)=10','test-image',[{'id':'1','fingerprint':'old'}])
+            second=await llm.read_and_coach('2(x-3)=10','changed-board-image',[{'id':'1','fingerprint':'old'}])
+            self.assertEqual(model.await_count,1)
+            self.assertEqual(first.lines[0].text,second.lines[0].text)
+            await llm.read_and_coach('2(x-3)=10','changed-board-image',[{'id':'1','fingerprint':'new'}])
+            self.assertEqual(model.await_count,2)
+
+    async def test_typed_correction_overrides_cached_ocr(self):
+        with patch('llm._generate',new_callable=AsyncMock,side_effect=AssertionError('Exact text needs no OCR')):
+            result=await llm.read_and_coach('2(x-3)=10','test-image',[{'id':'1','text':'2x-6=10','fingerprint':'old'}])
+        self.assertEqual(result.lines[0].text,'2x-6=10')
+        self.assertEqual(result.lines[0].transcriptionConfidence,1)
+
+    async def test_uncertain_ocr_never_enters_cache(self):
+        unclear=llm.VisionReading(lines=[llm.VisionRow(id='1',text='2x ? 3 = 10',confidence=.99)])
+        with patch('llm._generate',new_callable=AsyncMock,return_value=unclear) as model:
+            first=await llm.read_and_coach('2(x-3)=10','test-image',[{'id':'1','fingerprint':'old'}])
+            await llm.read_and_coach('2(x-3)=10','test-image',[{'id':'1','fingerprint':'old'}])
+        self.assertEqual(model.await_count,2)
+        self.assertEqual(first.lines[0].status,'uncertain')
+        self.assertLess(first.lines[0].transcriptionConfidence,.8)
+
+    async def test_problem_ambiguity_is_not_confidently_accepted(self):
+        with patch('llm._generate',new_callable=AsyncMock,return_value=llm.ProblemReading(text='2x + [?] = 10',confidence=.99)):
+            result=await llm.read_problem('test-image')
+        self.assertEqual(result.text,'2x + [?] = 10')
+        self.assertLess(result.confidence,.8)
+
+    async def test_blank_problem_returns_no_invented_text(self):
+        with patch('llm._generate',new_callable=AsyncMock,return_value=llm.ProblemReading(text='  ',confidence=.99)):
+            result=await llm.read_problem('test-image')
+        self.assertEqual(result.text,'')
+        self.assertEqual(result.confidence,0)
+
+
+class ModelSlotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_supported_typed_math_finishes_while_model_slot_is_held(self):
+        slot=asyncio.Semaphore(1)
+        request=AnalyzeRequest(problem='2(x-3)=10',lines=[{'id':'1','text':'2x-3=10'}])
+        with patch.object(main,'_analysis_slots',slot), patch('llm._generate',new_callable=AsyncMock,side_effect=AssertionError('No provider needed')) as model:
+            async with slot:
+                result=await asyncio.wait_for(main.analyze(request),timeout=1)
+        self.assertEqual(result['lines'][0]['status'],'incorrect')
+        self.assertEqual(result['processingMode'],'local')
+        model.assert_not_called()
+
+    async def test_unsupported_typed_math_waits_for_model_slot(self):
+        slot=asyncio.Semaphore(1)
+        request=AnalyzeRequest(problem='Find the mean of 4, 6, 8',lines=[{'id':'1','text':'mean = 6'}])
+        judgment=llm.ContextReading(checks=[llm.ContextCheck(id='1',status='correct',confidence=.99)],solved=True)
+        with patch.object(main,'_analysis_slots',slot), patch('llm._generate',new_callable=AsyncMock,return_value=judgment) as model:
+            async with slot:
+                task=asyncio.create_task(main.analyze(request))
+                await asyncio.sleep(.05)
+                self.assertFalse(task.done())
+                model.assert_not_called()
+            result=await asyncio.wait_for(task,timeout=1)
+        model.assert_awaited_once()
+        self.assertEqual(result['processingMode'],'ai')
+
+    async def test_problem_reader_shares_provider_slot(self):
+        slot=asyncio.Semaphore(1)
+        request=main.ProblemReadRequest(image='data:image/png;base64,aGVsbG8=',revision=46)
+        with patch.object(main,'_analysis_slots',slot), patch('llm.read_problem',new_callable=AsyncMock,return_value=llm.ProblemReading(text='x+3=7',confidence=.99)) as reader:
+            async with slot:
+                task=asyncio.create_task(main.read_problem(request))
+                await asyncio.sleep(.05)
+                self.assertFalse(task.done())
+                reader.assert_not_called()
+            result=await asyncio.wait_for(task,timeout=1)
+        reader.assert_awaited_once()
+        self.assertEqual(result['revision'],46)
 
 
 class AuthTests(unittest.IsolatedAsyncioTestCase):

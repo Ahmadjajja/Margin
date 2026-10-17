@@ -6,6 +6,7 @@ import ipaddress
 import json
 import html
 import secrets
+import re
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -40,6 +41,7 @@ class InputLine(BaseModel):
     y: float | None = None
     status: str | None = None
     hint: str | None = None
+    fingerprint: str | None = Field(default=None, max_length=200)
 
     @field_validator("id", mode="before")
     @classmethod
@@ -64,6 +66,11 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(AnalyzeRequest):
     messages: list[ChatMessage] = Field(min_length=1, max_length=24)
+
+
+class ProblemReadRequest(BaseModel):
+    image: str = Field(min_length=1, max_length=8_500_000, pattern=r"^data:image/(?:png|jpeg|webp);base64,")
+    revision: int = Field(default=0, ge=0)
 
 
 @app.middleware("http")
@@ -179,6 +186,18 @@ async def models():
     return {"models": await llm.available_models()}
 
 
+def symbolic_hint(problem: str, previous: str, current: str, reason: str) -> dict:
+    if "zero" in reason.lower():
+        return {"hint": "Could this denominator be zero?", "hint2": "Division is only defined when the denominator is nonzero.", "errorType": "division-by-zero", "explanation": reason}
+    if re.search(r"differentiat|derivative|d/dx", problem, re.I):
+        return {"hint": "Which derivative rule applies to each term?", "hint2": "Check the coefficient and exponent in each term separately.", "errorType": "derivative", "explanation": reason}
+    if re.search(r"(?:\d|[a-z])\s*\([^)]*[+−-]", previous, re.I) and "(" not in current:
+        return {"hint": "Does the outside factor multiply every term inside the parentheses?", "hint2": "Apply the outside factor to each term, keeping each term's sign.", "errorType": "distribution", "explanation": reason}
+    if "expression" in reason.lower():
+        return {"hint": "Which terms can you combine without changing the expression?", "hint2": "Check coefficients and signs one term at a time.", "errorType": "equivalence", "explanation": reason}
+    return {"hint": "Did you apply the same operation to both sides?", "hint2": "Compare signs and numbers with the previous line, one change at a time.", "errorType": "equivalence", "explanation": reason}
+
+
 def combine_feedback(request: AnalyzeRequest, reading: llm.BoardReading, verification: dict) -> dict:
     original = {line.id: line for line in request.lines}
     supplied = {line.id: line for line in reading.lines}
@@ -211,8 +230,9 @@ def combine_feedback(request: AnalyzeRequest, reading: llm.BoardReading, verific
             item["confidence"] = item["transcriptionConfidence"]
             if item["status"] == "correct":
                 item.update(hint="", hint2="", errorType="", explanation=verdict.get("reason", "This step preserves the mathematics."))
-            elif line.status != "incorrect" or line.confidence < 0.8:
-                item.update(hint="Compare this line with the previous one. Did the operation apply to every term?", hint2="Check each sign and make the same operation on both sides.", explanation=verdict.get("reason", "This transition changes the mathematics."), errorType="equivalence")
+            elif line.status != "incorrect" or line.confidence < 0.8 or not line.hint:
+                previous = result[-1]["text"] if result else request.problem
+                item.update(symbolic_hint(request.problem, previous, item["text"], verdict.get("reason", "This transition changes the mathematics.")))
         elif confidence < 0.8 or item["status"] == "uncertain":
             item.update(status="uncertain", hint="I’m not certain about this step yet. Can you explain the operation you used?", hint2="", errorType="")
             uncertain_before = True
@@ -221,7 +241,14 @@ def combine_feedback(request: AnalyzeRequest, reading: llm.BoardReading, verific
         if item["status"] != "incorrect":
             item["errorType"] = ""
         result.append(item)
-    solved = bool(reading.solved and result and all(row["status"] == "correct" for row in result))
+    all_correct = bool(result and all(row["status"] == "correct" for row in result))
+    symbolic_complete = False
+    if all_correct and result[-1]["verifiedBy"] == "sympy":
+        last = result[-1]["text"].strip()
+        simple_solution = bool(re.fullmatch(r"[a-zA-Z]\s*=\s*[-+−]?[\d.]+(?:\s*/\s*[-+−]?[\d.]+)?", last))
+        derivative_complete = result[-1].get("explanation") == "This derivative matches the original function."
+        symbolic_complete = (simple_solution and "=" in request.problem) or derivative_complete
+    solved = bool(all_correct and (reading.solved or symbolic_complete))
     if first_error:
         index = next(i for i, row in enumerate(result, 1) if row["id"] == first_error)
         summary = f"Let's take another look at line {index}."
@@ -231,8 +258,9 @@ def combine_feedback(request: AnalyzeRequest, reading: llm.BoardReading, verific
         summary = "Your steps check out. You've solved it!"
     else:
         summary = reading.summary
+    processing_mode = "local" if all(line.text.strip() for line in request.lines) and not reading.aiReviewed else "ai" if reading.aiReviewed else "vision"
     return {"revision": request.revision, "lines": result, "firstErrorLineId": first_error,
-            "summary": summary, "solved": solved, "verificationAvailable": verification.get("available", False)}
+            "summary": summary, "solved": solved, "verificationAvailable": verification.get("available", False), "processingMode": processing_mode}
 
 
 @app.post("/api/analyze")
@@ -242,21 +270,28 @@ async def analyze(request: AnalyzeRequest):
                 "summary": "Write your first step when you're ready.", "solved": False, "verificationAvailable": verifier_available()}
     if len({line.id for line in request.lines}) != len(request.lines):
         raise llm.LLMError("Each board line needs a unique identifier.", 400, "invalid_request")
-    async with _analysis_slots:
+    # Exact typed text and symbolic checking do not compete with a slow AI chat.
+    if all(line.text.strip() for line in request.lines):
         reading = await llm.read_and_coach(request.problem, request.image, [line.model_dump() for line in request.lines])
-        read_map = {line.id: line for line in reading.lines}
-        safe_lines = []
-        for source in request.lines:
-            row = read_map.get(source.id)
-            # A low-confidence transcription must never poison symbolic comparisons.
-            if not source.text.strip() and (row is None or row.transcriptionConfidence < 0.8):
-                break
-            safe_lines.append({"id": source.id, "text": source.text or (row.text if row else "")})
-        try:
-            verification = await asyncio.wait_for(asyncio.to_thread(verify_lines, request.problem, safe_lines), timeout=5)
-        except (Exception, asyncio.TimeoutError):
-            verification = {"available": False, "results": []}
-        return combine_feedback(request, reading, verification)
+    else:
+        async with _analysis_slots:
+            reading = await llm.read_and_coach(request.problem, request.image, [line.model_dump() for line in request.lines])
+    read_map = {line.id: line for line in reading.lines}
+    safe_lines = []
+    for source in request.lines:
+        row = read_map.get(source.id)
+        # A low-confidence transcription must never poison symbolic comparisons.
+        if not source.text.strip() and (row is None or row.transcriptionConfidence < 0.8):
+            break
+        safe_lines.append({"id": source.id, "text": source.text or (row.text if row else "")})
+    try:
+        verification = await asyncio.wait_for(asyncio.to_thread(verify_lines, request.problem, safe_lines), timeout=5)
+    except (Exception, asyncio.TimeoutError):
+        verification = {"available": False, "results": []}
+    if llm.unverified_ids(reading, verification):
+        async with _analysis_slots:
+            reading = await llm.judge_unverified(request.problem, reading, verification)
+    return combine_feedback(request, reading, verification)
 
 
 @app.post("/api/chat")
@@ -266,6 +301,13 @@ async def chat(request: ChatRequest):
     async with _analysis_slots:
         reply = await llm.tutor_chat(request.problem, request.image, [line.model_dump() for line in request.lines], [message.model_dump() for message in request.messages])
     return {"reply": reply}
+
+
+@app.post("/api/read-problem")
+async def read_problem(request: ProblemReadRequest):
+    async with _analysis_slots:
+        reading = await llm.read_problem(request.image)
+    return {"text": reading.text, "confidence": reading.confidence, "revision": request.revision}
 
 
 @app.get("/")

@@ -6,8 +6,11 @@ This is a local hackathon prototype built with **FastAPI, plain HTML/CSS/JavaScr
 
 ## The experience
 
-- Draw with a stylus, finger, or mouse, or use **Type a step** for keyboard input.
-- Pause for two seconds to trigger a board check. **Check now** is also available.
+- Start in the separate **Problem** area. Type the statement or write it on the top canvas, then review what the tutor read in the right panel. Correct the text if needed and confirm it before solving.
+- Work in the **Solution** area below. Only this canvas is checked for solution steps; the confirmed problem supplies the context. Changing the problem requires confirmation again.
+- Type a step and press **Enter** for an immediate check. Supported typed algebra goes directly to SymPy, without waiting for an AI request.
+- Draw with a stylus, finger, or mouse. Pause for two seconds to trigger a handwriting check; **Check work** is also available.
+- Review what the tutor read. **Edit reading** fixes a handwriting transcription without erasing your work; **Edit step** changes a typed equation on the board.
 - See the first questionable line highlighted beside a Socratic hint. Ask for a stronger hint when needed.
 - Erase or undo a mistake, rewrite it, and receive fresh feedback on the current board.
 - Ask questions in the adjacent chat, which receives the problem and current board.
@@ -92,11 +95,15 @@ If the tablet cannot connect, check that both devices are on the same network an
 
 ## How a check works
 
-1. **Capture:** the browser groups strokes into rows and assigns stable IDs and normalized bounding boxes. It sends the current board image, problem, row positions, and any typed text after a two-second pause.
-2. **Read and coach:** the provider transcribes handwritten rows and returns structured judgments, separate legibility and math-confidence scores, and short hints.
-3. **Verify:** SymPy checks supported algebraic transitions against the original problem and preceding line. A handwritten transcription must have confidence of at least **0.8** before it enters symbolic verification. Exact typed input bypasses handwriting recognition.
-4. **Combine:** a definitive symbolic result takes priority. Unsupported math falls back to contextual AI judgment, with the same **0.8** minimum for confident feedback. Unclear work is marked uncertain. After the earliest error or uncertainty, dependent rows wait for clarification.
-5. **Display:** the frontend uses its own row boxes to position highlights. It runs one board check at a time and ignores responses for an older board revision, preventing erased mistakes from reappearing through delayed feedback.
+1. **Capture:** the browser groups strokes into rows with stable IDs, content fingerprints, and normalized bounding boxes. Export preserves the displayed aspect ratio so handwriting is not stretched before recognition.
+2. **Read only when needed:** typed rows and corrected transcriptions skip image recognition. A compact vision request reads new handwritten rows; unchanged, confidently read rows can reuse a bounded in-memory cache. This cache is temporary request optimization, not student mistake memory.
+3. **Verify locally:** SymPy checks supported algebraic transitions against the original problem and preceding line. A handwritten transcription must have confidence of at least **0.8** before it enters symbolic verification. Supported typed algebra needs no model call. Local hints point to distribution, signs, domains, or equivalent operations.
+4. **Review broader math:** unsupported steps receive contextual AI review, with a **0.8** confidence minimum. Unclear work is uncertain, never automatically wrong. After the earliest error or uncertainty, dependent rows wait for clarification.
+5. **Display:** the frontend uses its own row boxes to position highlights, shows the recognized text, and lets the student correct it. One board check runs at a time; older responses cannot overwrite newer work. Tutor chat uses the current problem and board.
+
+ChatGPT defaults to `gpt-6-luna` with reasoning `none` for a faster reading pass. Optional `.env` settings `CHATGPT_MODEL` and `CHATGPT_REASONING` change that choice. In a two-row image test, the compact path took about **2.9 seconds**, versus **7.0 seconds** for the original full reading-and-coaching call. Those are observed test timings, not latency guarantees; handwriting checks also include the two-second drawing pause. Verify with your actual device and handwriting before presenting.
+
+The three typed stages of the sample algebra demo returned from the local endpoint in **43–130 ms** in a live test, with no AI calls. End-to-end browser checks covered Enter-to-add, editing the mistaken step, clearing its underline, completing the solution, mouse-drawn recognition, and correcting the recognized text while preserving the ink.
 
 The verifier compares real solution sets for supported single-variable equations, so a valid alternate path such as `2(x - 3) = 10` → `x - 3 = 5` is accepted. It also checks rational domain restrictions, basic simplification, and selected derivatives. Input goes through a bounded arithmetic grammar, not Python evaluation.
 
@@ -116,7 +123,7 @@ The verifier compares real solution sets for supported single-variable equations
 | `run.py`, `start.ps1` | Local launchers |
 | `tests/` | Math, backend, and board regression checks |
 
-`GET /api/status` reports the configured connection and SymPy availability. `POST /api/analyze` checks a board; `POST /api/chat` answers with board context. The server does not save board images to disk. The browser stores the current problem, strokes, and recent conversation locally; AI requests send the current problem and board to the active provider.
+`GET /api/status` reports the configured connection and SymPy availability. `POST /api/read-problem` transcribes the separate problem canvas without solving it; the student confirms or edits that transcription. `POST /api/analyze` checks the solution board against the confirmed problem; `POST /api/chat` answers with that context. The server does not save board images to disk. The browser stores the current problem, strokes, and recent conversation locally; AI requests send the relevant problem or solution image to the active provider.
 
 ## Tests and demonstration
 
